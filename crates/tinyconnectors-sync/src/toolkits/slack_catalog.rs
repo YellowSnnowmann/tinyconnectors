@@ -92,10 +92,6 @@ pub(super) const CURATED: &[CuratedTool] = &[
         slug: "SLACK_CREATE_USER_GROUP",
         scope: ToolScope::Write,
     },
-    CuratedTool {
-        slug: "SLACK_INVITE_USERS_TO_A_SLACK_CHANNEL",
-        scope: ToolScope::Write,
-    },
     // ── admin ───────────────────────────────────────────────────────
     // Everything that removes something, or changes who can reach it.
     // Several of these read as `Read` to the verb heuristic — `ARCHIVE`,
@@ -131,6 +127,16 @@ pub(super) const CURATED: &[CuratedTool] = &[
     },
     CuratedTool {
         slug: "SLACK_CONVERT_CHANNEL_TO_PRIVATE",
+        scope: ToolScope::Admin,
+    },
+    // Adding someone to a channel hands them its whole history, which is a
+    // change to who can see what however friendly the verb sounds. The verb
+    // heuristic reads `INVITE` as a plain read, and
+    // `SLACK_INVITE_USER_TO_WORKSPACE` above is already `Admin`; leaving this
+    // one at `Write` let a "changes, but nothing destructive" preference grant
+    // channel access.
+    CuratedTool {
+        slug: "SLACK_INVITE_USERS_TO_A_SLACK_CHANNEL",
         scope: ToolScope::Admin,
     },
 ];

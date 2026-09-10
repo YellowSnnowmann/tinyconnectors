@@ -205,7 +205,13 @@ impl Cursor {
             return Self::default();
         };
         let mut fields = raw.splitn(4, '|');
-        let index = fields.next().unwrap_or_default().parse().unwrap_or(0);
+        // A position that does not parse names no channel — and a history or
+        // thread cursor beside it belongs to a channel nobody can now identify.
+        // Keeping them would ask Slack to resume channel zero from another
+        // channel's page, which it refuses, costing that channel the walk.
+        let Ok(index) = fields.next().unwrap_or_default().parse() else {
+            return Self::default();
+        };
         let owned = |field: Option<&str>| {
             field
                 .filter(|value| !value.is_empty())
@@ -256,9 +262,9 @@ struct WalkState {
     /// Messages in the channel being read whose replies are still owed.
     #[serde(default)]
     threads: Vec<String>,
-    /// Newest message id fully read per channel, `channel id → Slack ts`.
+    /// Newest message fully read per channel, `channel id → mark`.
     #[serde(default)]
-    high_water: BTreeMap<String, String>,
+    high_water: BTreeMap<String, Mark>,
     /// Newest message id *seen* per channel, promoted once the channel ends.
     #[serde(default)]
     pending: BTreeMap<String, String>,
@@ -310,8 +316,10 @@ impl WalkState {
     /// The high-water mark wins when there is one: it is never older than the
     /// bound, having been set by a run that already respected it.
     fn oldest_for(&self, channel: &str, depth_days: Option<u32>) -> Option<String> {
-        if let Some(mark) = self.high_water.get(channel) {
-            return Some(mark.clone());
+        if let Some(mark) = self.high_water.get(channel)
+            && mark.covers(depth_days)
+        {
+            return Some(mark.ts.clone());
         }
         depth_days.map(|days| {
             let since = Utc::now() - TimeDelta::days(i64::from(days));
@@ -320,15 +328,49 @@ impl WalkState {
     }
 
     /// Promote the pending mark for a channel that has just been exhausted.
-    fn commit_high_water(&mut self, channel: &str) {
-        if let Some(newest) = self.pending.remove(channel) {
-            self.high_water.insert(channel.to_string(), newest);
+    ///
+    /// `depth_days` is the window the run read under, and is stored with the
+    /// position: a later, wider run has to be able to tell that this mark does
+    /// not speak for the ground it wants to cover.
+    fn commit_high_water(&mut self, channel: &str, depth_days: Option<u32>) {
+        if let Some(ts) = self.pending.remove(channel) {
+            self.high_water
+                .insert(channel.to_string(), Mark { ts, depth_days });
         }
     }
 
     /// Whether the user directory needs re-reading.
     fn users_are_stale(&self, now_ms: i64) -> bool {
         self.users.is_empty() || now_ms - self.users_fetched_ms > USERS_TTL_MS
+    }
+}
+
+/// How far a channel has been read, and under what window.
+///
+/// The window matters as much as the position. A mark collected under a
+/// fourteen-day bound says nothing about the ninety-first day, so a later run
+/// asking for more must be allowed past it — otherwise widening the setting
+/// silently returns nothing older and says so nowhere.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct Mark {
+    /// Newest message id read to completion, as a Slack `ts`.
+    ts: String,
+    /// Days the run that set it was bounded to; `None` was unbounded.
+    #[serde(default)]
+    depth_days: Option<u32>,
+}
+
+impl Mark {
+    /// Whether this mark already covers a run bounded to `requested`.
+    ///
+    /// An unbounded mark covers everything. An unbounded *request* is wider
+    /// than any bounded mark, so nothing bounded covers it.
+    fn covers(&self, requested: Option<u32>) -> bool {
+        match (self.depth_days, requested) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(collected), Some(requested)) => requested <= collected,
+        }
     }
 }
 
@@ -478,7 +520,14 @@ impl SlackProvider {
                     error = %error,
                     "[connectors][slack] thread skipped"
                 );
-                return Ok(after_thread(walk, position, channel, Vec::new(), None));
+                return Ok(after_thread(
+                    walk,
+                    position,
+                    channel,
+                    context.limits.depth_days,
+                    Vec::new(),
+                    None,
+                ));
             }
         };
 
@@ -488,7 +537,14 @@ impl SlackProvider {
         // dropping it here saves the round trip through the seen-set.
         let (records, versions) = records_from(&replies, channel, &walk.users, Some(parent));
         let more = next_cursor(&payload);
-        let mut read = after_thread(walk, position, channel, records, more);
+        let mut read = after_thread(
+            walk,
+            position,
+            channel,
+            context.limits.depth_days,
+            records,
+            more,
+        );
         read.page.versions = versions;
         Ok(read)
     }
@@ -564,7 +620,7 @@ impl SlackProvider {
         } else {
             // Nothing more in this channel and nothing owed: promote the mark
             // it has been collecting, and move on.
-            walk.commit_high_water(&channel.id);
+            walk.commit_high_water(&channel.id, context.limits.depth_days);
             Cursor::new(position.index + 1, None)
         };
 
@@ -661,6 +717,7 @@ fn after_thread(
     walk: &mut WalkState,
     position: &Cursor,
     channel: &Channel,
+    depth_days: Option<u32>,
     records: Vec<ConnectorRecord>,
     more: Option<String>,
 ) -> Read {
@@ -679,7 +736,7 @@ fn after_thread(
         Some(Cursor::new(position.index, history))
     } else {
         // Nothing left in this channel, replies included: the mark is safe.
-        walk.commit_high_water(&channel.id);
+        walk.commit_high_water(&channel.id, depth_days);
         Some(Cursor::new(position.index + 1, None))
     };
 

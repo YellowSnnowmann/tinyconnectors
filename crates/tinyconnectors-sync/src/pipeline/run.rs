@@ -124,6 +124,7 @@ pub async fn run_sync(
             .map(|(id, version)| (id.as_str(), version.as_str()))
             .collect();
 
+        let mut truncated = false;
         for record in page.records {
             let version = versions.get(record.item_id.as_str()).copied();
             if !state.needs_ingest(&record.item_id, version) {
@@ -134,8 +135,26 @@ pub async fn run_sync(
             outcome.batch.records.push(record);
 
             if outcome.batch.records.len() >= context.limits.max_items {
+                truncated = true;
                 break;
             }
+        }
+
+        if truncated {
+            // Stop *without* advancing. The records below the cut were never
+            // marked, and this page's `next_cursor` names the page after them:
+            // moving to it steps over records the run never saw.
+            //
+            // A flat toolkit recovers from that on its own — the walk reaches
+            // the end, `restart_from_top` fires, and the second pass finds them
+            // still unmarked. A provider that keeps a floor of its own does
+            // not: Slack's high-water mark would sit above the stranded
+            // records, and no later run would ever ask for them again.
+            //
+            // The cost of stopping here is re-reading one page next time, which
+            // the seen-set turns into skips. The cost of not stopping is losing
+            // whatever sat below the cut.
+            break;
         }
 
         cursor = page.next_cursor;

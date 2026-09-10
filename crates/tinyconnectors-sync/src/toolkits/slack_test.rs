@@ -160,10 +160,22 @@ fn a_cursor_survives_a_round_trip() {
 fn an_unreadable_cursor_restarts_the_walk_rather_than_failing_it() {
     // The seen-set turns a re-read into skips, so restarting costs requests.
     // Erroring would cost the connection every future sync.
-    for raw in ["", "not-a-number|abc", "|", "garbage"] {
+    for raw in ["", "|", "garbage"] {
         assert_eq!(Cursor::decode(Some(raw)).index, 0, "{raw}");
     }
     assert_eq!(Cursor::decode(None), Cursor::new(0, None));
+}
+
+#[test]
+fn an_index_that_does_not_parse_takes_the_rest_of_the_cursor_with_it() {
+    // Keeping the history cursor beside an unreadable index would ask Slack to
+    // resume channel zero from a page belonging to some other channel. It
+    // refuses, the page reads as a channel failure, and that channel loses the
+    // walk. Nothing beside a position nobody can identify means anything.
+    let ruined = Cursor::decode(Some("not-a-number|hist|1700000000.000100|replies"));
+    assert_eq!(ruined, Cursor::default());
+    assert!(ruined.history.is_none());
+    assert!(ruined.thread.is_none());
 }
 
 // ── the walk ────────────────────────────────────────────────────────
@@ -664,9 +676,17 @@ async fn a_run_stops_at_the_item_limit_and_the_next_one_carries_on() {
         "SLACK_LIST_CONVERSATIONS",
         Ok(channels(&[("C1", "eng"), ("C2", "ops")], "")),
     );
+    // C1 is read, truncates the run at one record, and is read again by the
+    // next run — which skips what it already has and moves on to C2.
+    for _ in 0..2 {
+        actions.queue(
+            "SLACK_FETCH_CONVERSATION_HISTORY",
+            Ok(history(&[message("1700000001.000100", "first")], "")),
+        );
+    }
     actions.queue(
-        "SLACK_FETCH_CONVERSATION_HISTORY",
-        Ok(history(&[message("1700000001.000100", "first")], "")),
+        "SLACK_LIST_CONVERSATIONS",
+        Ok(channels(&[("C1", "eng"), ("C2", "ops")], "")),
     );
     actions.queue(
         "SLACK_FETCH_CONVERSATION_HISTORY",
@@ -983,4 +1003,99 @@ async fn the_directory_is_read_across_pages() {
         "a name from the second page still resolves"
     );
     assert_eq!(page.records[0].content, "hi @Ada");
+}
+
+#[tokio::test]
+async fn a_wider_depth_window_reads_past_a_mark_collected_under_a_narrower_one() {
+    // The host forwards a per-source "sync depth" into the run's limits. Once a
+    // channel is marked, honouring the mark unconditionally would mean widening
+    // that setting returns nothing older and says so nowhere.
+    let actions = Arc::new(ScriptedActions::default());
+    for _ in 0..3 {
+        actions.queue(
+            "SLACK_LIST_CONVERSATIONS",
+            Ok(channels(&[("C1", "eng")], "")),
+        );
+    }
+    actions.queue(
+        "SLACK_FETCH_CONVERSATION_HISTORY",
+        Ok(history(&[message("1700000009.000100", "seen")], "")),
+    );
+    for _ in 0..2 {
+        actions.queue("SLACK_FETCH_CONVERSATION_HISTORY", Ok(history(&[], "")));
+    }
+
+    let store = Arc::new(MemoryStore::default());
+    let mut context = context(actions.clone(), store);
+    let provider = SlackProvider;
+
+    // A fortnight-deep walk marks the channel.
+    context.limits = SyncLimits {
+        max_items: 50,
+        depth_days: Some(14),
+    };
+    provider.fetch_page(&context, None).await.unwrap();
+
+    // Ninety days is wider than the mark speaks for, so the mark stands aside.
+    context.limits = SyncLimits {
+        max_items: 50,
+        depth_days: Some(90),
+    };
+    provider.fetch_page(&context, None).await.unwrap();
+
+    // A week is inside it, so the mark still saves the re-read.
+    context.limits = SyncLimits {
+        max_items: 50,
+        depth_days: Some(7),
+    };
+    provider.fetch_page(&context, None).await.unwrap();
+
+    let asked = actions.calls_to("SLACK_FETCH_CONVERSATION_HISTORY");
+    assert_ne!(
+        asked[1]["oldest"],
+        json!("1700000009.000100"),
+        "a wider window must read past the mark"
+    );
+    assert_eq!(
+        asked[2]["oldest"],
+        json!("1700000009.000100"),
+        "a narrower window is already covered by it"
+    );
+}
+
+#[tokio::test]
+async fn an_unbounded_run_reads_past_a_bounded_mark() {
+    let actions = Arc::new(ScriptedActions::default());
+    for _ in 0..2 {
+        actions.queue(
+            "SLACK_LIST_CONVERSATIONS",
+            Ok(channels(&[("C1", "eng")], "")),
+        );
+    }
+    actions.queue(
+        "SLACK_FETCH_CONVERSATION_HISTORY",
+        Ok(history(&[message("1700000009.000100", "seen")], "")),
+    );
+    actions.queue("SLACK_FETCH_CONVERSATION_HISTORY", Ok(history(&[], "")));
+
+    let store = Arc::new(MemoryStore::default());
+    let mut context = context(actions.clone(), store);
+    context.limits = SyncLimits {
+        max_items: 50,
+        depth_days: Some(30),
+    };
+    SlackProvider.fetch_page(&context, None).await.unwrap();
+
+    context.limits = SyncLimits {
+        max_items: 50,
+        depth_days: None,
+    };
+    SlackProvider.fetch_page(&context, None).await.unwrap();
+
+    let asked = actions.calls_to("SLACK_FETCH_CONVERSATION_HISTORY");
+    assert!(
+        asked[1].get("oldest").is_none(),
+        "no bound is wider than any bound: {}",
+        asked[1]
+    );
 }
