@@ -67,7 +67,7 @@ fn context(toolkit: &str, payload: serde_json::Value) -> (Arc<FixedActions>, Pro
 #[test]
 fn ships_every_toolkit_that_has_a_curated_catalog() {
     let registry = default_registry();
-    for toolkit in ["gmail", "github", "notion", "linear", "clickup"] {
+    for toolkit in ["gmail", "github", "notion", "linear", "clickup", "slack"] {
         assert!(registry.get(toolkit).is_some(), "{toolkit} must be shipped");
     }
     assert_eq!(registry.agent_ready_toolkits().len(), registry.len());
@@ -275,6 +275,10 @@ fn every_toolkit_reports_a_complete_capability_row() {
 async fn every_toolkit_reads_a_page_into_records() {
     // The payload shapes differ per toolkit, so each is given the envelope its
     // own spec names. What is checked is that the spec and the reader agree.
+    //
+    // Slack is absent: it reads a conversation list and a history with two
+    // different actions, and this double answers every action with the same
+    // payload. `slack_test.rs` drives it with a scripted runner instead.
     let payloads = [
         (
             "gmail",
@@ -316,7 +320,7 @@ async fn every_toolkit_reads_a_page_into_records() {
 
 #[tokio::test]
 async fn every_toolkit_asks_its_own_fetch_action() {
-    for toolkit in ["gmail", "github", "notion", "linear", "clickup"] {
+    for toolkit in ["gmail", "github", "notion", "linear", "clickup", "slack"] {
         let (actions, context) = context(toolkit, json!({}));
         default_registry()
             .get(toolkit)
@@ -388,6 +392,11 @@ async fn linear_reads_its_display_name() {
 #[tokio::test]
 async fn every_toolkit_resumes_from_a_cursor() {
     // The cursor argument is the one thing that makes a second page possible.
+    //
+    // Slack is absent by design: its cursor names a channel and a position
+    // within it, so it is decoded rather than forwarded, and asserting that the
+    // raw string reaches the provider would assert the opposite of what it
+    // does. `slack_test.rs` covers its round trip.
     for toolkit in ["gmail", "github", "notion", "linear", "clickup"] {
         let (actions, context) = context(toolkit, json!({}));
         default_registry()
