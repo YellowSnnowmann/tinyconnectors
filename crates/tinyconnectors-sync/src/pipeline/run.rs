@@ -124,8 +124,13 @@ pub async fn run_sync(
             .map(|(id, version)| (id.as_str(), version.as_str()))
             .collect();
 
-        let mut truncated = false;
+        // Counted rather than inferred from the limit: a page whose last record
+        // is the one that fills the budget left nothing behind, and refusing to
+        // advance past it would re-read a whole page on every run for no gain.
+        let page_len = page.records.len();
+        let mut consumed = 0usize;
         for record in page.records {
+            consumed += 1;
             let version = versions.get(record.item_id.as_str()).copied();
             if !state.needs_ingest(&record.item_id, version) {
                 outcome.records_skipped += 1;
@@ -135,12 +140,11 @@ pub async fn run_sync(
             outcome.batch.records.push(record);
 
             if outcome.batch.records.len() >= context.limits.max_items {
-                truncated = true;
                 break;
             }
         }
 
-        if truncated {
+        if consumed < page_len {
             // Stop *without* advancing. The records below the cut were never
             // marked, and this page's `next_cursor` names the page after them:
             // moving to it steps over records the run never saw.

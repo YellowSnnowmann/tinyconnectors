@@ -294,6 +294,26 @@ async fn a_record_below_the_item_limit_is_not_stepped_over() {
     );
 }
 
+#[tokio::test]
+async fn a_page_the_limit_exactly_consumes_still_advances() {
+    // The budget runs out on the page's last record, so nothing is left
+    // behind. Holding the position here would re-read a whole page on every
+    // run to rediscover records the seen-set already knows.
+    let provider = ScriptedProvider::new(vec![Ok(page(&["m1", "m2"], Some("p2")))]);
+    let store = Arc::new(MemoryStore::default());
+
+    let outcome = run_sync(&provider, &context(store, 2), SyncReason::Scheduled)
+        .await
+        .unwrap();
+
+    assert_eq!(ids(&outcome.batch.records), vec!["m1", "m2"]);
+    assert_eq!(outcome.batch.cursor.as_deref(), Some("p2"));
+    assert!(
+        !outcome.batch.complete,
+        "the provider reported another page"
+    );
+}
+
 /// The ids of a batch, in order.
 fn ids(records: &[ConnectorRecord]) -> Vec<&str> {
     records

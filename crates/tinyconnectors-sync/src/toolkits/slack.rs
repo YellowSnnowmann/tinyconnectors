@@ -72,6 +72,7 @@ use tinyconnectors_bus::records::ConnectorRecord;
 
 use super::identity::pick;
 use super::slack_catalog::CURATED;
+use super::slack_parse::{has_replies, is_fatal, messages_in, next_cursor, records_from};
 use crate::pipeline::{ProviderPage, first_array, pick_str};
 use crate::provider::{ConnectorProvider, ProviderContext, ProviderUserProfile};
 use crate::scope::CuratedTool;
@@ -116,35 +117,12 @@ const USERS_PER_PAGE: usize = 200;
 /// be the wrong trade.
 const USER_PAGES_MAX: usize = 5;
 
-/// Longest message body kept, in characters.
-///
-/// Matches the cap the shared page reader applies. A Slack message is rarely
-/// anywhere near it; a pasted stack trace is, and one such record can outweigh
-/// a hundred useful ones in both storage and the attention of anything reading
-/// them back.
-const MAX_BODY_CHARS: usize = 20_000;
-
 /// How long a cached user directory is trusted, in milliseconds.
 ///
 /// A day. Display names change rarely, and the cost of a stale one is a name
 /// that reads slightly wrong in a message body — far below the cost of another
 /// directory fetch at the head of every walk.
 const USERS_TTL_MS: i64 = 24 * 60 * 60 * 1000;
-
-/// Slack error codes that mean no later channel will succeed either.
-///
-/// Everything else — a channel the account is not in, an archived conversation,
-/// a rate limit on one busy channel — is per-channel and must not fail the
-/// workspace. These are the connection-level ones, where continuing would spend
-/// a request per channel to collect the same failure.
-const FATAL_AUTH_ERRORS: &[&str] = &[
-    "invalid_auth",
-    "not_authed",
-    "token_revoked",
-    "token_expired",
-    "account_inactive",
-    "missing_scope",
-];
 
 /// Where the walk is: which channel, where in its history, and which of its
 /// threads is being drained.
@@ -238,13 +216,16 @@ impl Cursor {
 }
 
 /// One conversation the walk knows about.
+///
+/// Reachable from [`super::slack_parse`], which needs the channel a record
+/// belongs to in order to give it a channel-qualified id and title.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct Channel {
+pub(super) struct Channel {
     /// Slack channel id, e.g. `C0123ABCD`.
-    id: String,
+    pub(super) id: String,
     /// Channel name without the leading `#`.
     #[serde(default)]
-    name: String,
+    pub(super) name: String,
 }
 
 /// What the walk remembers between pages and between runs.
@@ -524,6 +505,7 @@ impl SlackProvider {
                     walk,
                     position,
                     channel,
+                    parent,
                     context.limits.depth_days,
                     Vec::new(),
                     None,
@@ -541,6 +523,7 @@ impl SlackProvider {
             walk,
             position,
             channel,
+            parent,
             context.limits.depth_days,
             records,
             more,
@@ -717,17 +700,22 @@ fn after_thread(
     walk: &mut WalkState,
     position: &Cursor,
     channel: &Channel,
+    parent: &str,
     depth_days: Option<u32>,
     records: Vec<ConnectorRecord>,
     more: Option<String>,
 ) -> Read {
     let history = position.history.clone();
     let next = if let Some(more) = more {
-        // Same thread, further in.
-        position
-            .thread
-            .clone()
-            .map(|parent| Cursor::in_thread(position.index, history, parent, Some(more)))
+        // Same thread, further in. Named from the argument rather than read
+        // back out of the cursor: a `None` there would silently report the
+        // whole workspace walked and abandon every channel after this one.
+        Some(Cursor::in_thread(
+            position.index,
+            history,
+            parent.to_string(),
+            Some(more),
+        ))
     } else if let Some(parent) = walk.threads.pop() {
         // This channel still owes replies elsewhere.
         Some(Cursor::in_thread(position.index, history, parent, None))
@@ -757,207 +745,6 @@ fn empty_page(next: Option<String>) -> ProviderPage {
         versions: Vec::new(),
         next_cursor: next,
     }
-}
-
-/// The messages in a history or thread payload, across Composio's envelopes.
-fn messages_in(payload: &Value) -> Vec<Value> {
-    first_array(
-        payload,
-        &["/data/messages", "/messages", "/data/data/messages"],
-    )
-}
-
-/// The timestamp of a message that has replies, if it has any.
-fn has_replies(message: &Value) -> Option<String> {
-    let replies = message
-        .get("reply_count")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    (replies > 0).then(|| pick_str(message, &["ts"]))?
-}
-
-/// Whether a failure means the whole connection is unusable.
-fn is_fatal(error: &Error) -> bool {
-    let message = error.to_string().to_ascii_lowercase();
-    FATAL_AUTH_ERRORS.iter().any(|code| message.contains(code))
-}
-
-/// Slack's next page marker, across the envelopes Composio wraps it in.
-///
-/// Not [`crate::pipeline::next_page_token`]: that looks for `nextPageToken`,
-/// which is Google's spelling. Slack reports `response_metadata.next_cursor`.
-fn next_cursor(payload: &Value) -> Option<String> {
-    [
-        "/data/response_metadata/next_cursor",
-        "/response_metadata/next_cursor",
-        "/data/data/response_metadata/next_cursor",
-        "/data/next_cursor",
-        "/next_cursor",
-    ]
-    .iter()
-    .find_map(|pointer| payload.pointer(pointer).and_then(Value::as_str))
-    .map(str::trim)
-    .filter(|cursor| !cursor.is_empty())
-    .map(str::to_owned)
-}
-
-/// Turn a page of messages into records and the versions they report.
-///
-/// `skip` names a timestamp to leave out — the parent Slack repeats at the head
-/// of its own thread.
-fn records_from(
-    messages: &[Value],
-    channel: &Channel,
-    users: &BTreeMap<String, String>,
-    skip: Option<&str>,
-) -> (Vec<ConnectorRecord>, Vec<(String, String)>) {
-    let mut records = Vec::with_capacity(messages.len());
-    let mut versions = Vec::new();
-    for message in messages {
-        if let Some(skip) = skip
-            && pick_str(message, &["ts"]).as_deref() == Some(skip)
-        {
-            continue;
-        }
-        let Some(record) = record_from(message, channel, users, skip.is_some()) else {
-            continue;
-        };
-        // An edited message re-ingests; an untouched one does not. Slack
-        // reports the edit as its own timestamp, which is exactly a version.
-        if let Some(edited) = pick_str(message, &["edited.ts"]) {
-            versions.push((record.item_id.clone(), edited));
-        }
-        records.push(record);
-    }
-    (records, versions)
-}
-
-/// One message as a record, or `None` when there is nothing to ingest.
-///
-/// A message with no timestamp has no stable id, and one with no text is a
-/// join notice or a file share whose body is elsewhere. Both would fill a
-/// user's memory with rows that say nothing.
-fn record_from(
-    message: &Value,
-    channel: &Channel,
-    users: &BTreeMap<String, String>,
-    reply: bool,
-) -> Option<ConnectorRecord> {
-    let ts = pick_str(message, &["ts"])?;
-    let text = pick_str(message, &["text"])?;
-    let rendered = render(&text, users);
-    if rendered.trim().is_empty() {
-        return None;
-    }
-
-    // An id the directory cannot resolve is still worth keeping: a reader can
-    // look `U04AB` up, and collapsing every unresolved author into one word
-    // would make messages from different people indistinguishable. This is the
-    // same fallback `render` applies to a mention.
-    let author = pick_str(message, &["user"])
-        .map(|id| users.get(&id).cloned().unwrap_or(id))
-        .or_else(|| pick_str(message, &["username", "bot_id"]))
-        .unwrap_or_else(|| "unknown".to_string());
-    let kind = if reply { " (reply)" } else { "" };
-
-    Some(ConnectorRecord {
-        // Channel-qualified: a Slack `ts` is unique within a channel, and the
-        // run loop dedupes against one flat set for the whole connection.
-        item_id: format!("{}:{ts}", channel.id),
-        title: format!("#{} — {author}{kind}", channel.name),
-        content: truncate(&rendered),
-        mime: Some("text/plain".to_string()),
-        url: pick_str(message, &["permalink"]).or_else(|| Some(permalink(&channel.id, &ts))),
-        updated_at_ms: to_millis(&ts),
-        tags: Vec::new(),
-    })
-}
-
-/// A link back to one message.
-///
-/// `slack.com` rather than the workspace's own domain: the workspace is not
-/// known here, and Slack redirects this form to the right one for whoever
-/// opens it.
-fn permalink(channel: &str, ts: &str) -> String {
-    format!(
-        "https://slack.com/archives/{channel}/p{}",
-        ts.replace('.', "")
-    )
-}
-
-/// Slack's `seconds.microseconds` stamp in milliseconds.
-fn to_millis(ts: &str) -> Option<i64> {
-    let (seconds, fraction) = ts.split_once('.').unwrap_or((ts, "0"));
-    let seconds: i64 = seconds.parse().ok()?;
-    // Three digits of the fraction are milliseconds; a shorter one is padded
-    // rather than misread as a smaller number.
-    let millis: i64 = format!("{fraction:0<3}")
-        .chars()
-        .take(3)
-        .collect::<String>()
-        .parse()
-        .unwrap_or(0);
-    Some(seconds * 1000 + millis)
-}
-
-/// Message text with Slack's reference syntax resolved.
-///
-/// `<@U04AB>` is a user, `<#C07XY|deploys>` a channel, `<https://…|label>` a
-/// link. Left raw they are the bulk of what makes ingested Slack unreadable —
-/// and an unresolved id is not something a reader can look up later.
-fn render(raw: &str, users: &BTreeMap<String, String>) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut rest = raw;
-
-    while let Some(start) = rest.find('<') {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 1..];
-        let Some(end) = after.find('>') else {
-            // An unmatched `<` is literal text, not a broken reference.
-            out.push_str(&rest[start..]);
-            return out;
-        };
-        let (token, remainder) = after.split_at(end);
-        out.push_str(&resolve(token, users));
-        rest = &remainder[1..];
-    }
-    out.push_str(rest);
-    out
-}
-
-/// One `<…>` reference, without its angle brackets.
-fn resolve(token: &str, users: &BTreeMap<String, String>) -> String {
-    let (target, label) = token.split_once('|').unwrap_or((token, ""));
-    match target.as_bytes().first() {
-        // A user: the directory's name, the inline label, or the bare id.
-        Some(b'@') => {
-            let id = &target[1..];
-            let name = users
-                .get(id)
-                .map(String::as_str)
-                .or(Some(label).filter(|label| !label.is_empty()))
-                .unwrap_or(id);
-            format!("@{name}")
-        }
-        // A channel: Slack usually inlines the name, so prefer it.
-        Some(b'#') => {
-            let id = &target[1..];
-            let name = if label.is_empty() { id } else { label };
-            format!("#{name}")
-        }
-        // A link: the label if it has one, else the target itself.
-        _ if label.is_empty() => target.to_string(),
-        _ => label.to_string(),
-    }
-}
-
-/// Cap a body at [`MAX_BODY_CHARS`], on a character boundary.
-fn truncate(text: &str) -> String {
-    let text = text.trim();
-    if text.chars().count() <= MAX_BODY_CHARS {
-        return text.to_string();
-    }
-    text.chars().take(MAX_BODY_CHARS).collect::<String>()
 }
 
 #[cfg(test)]
