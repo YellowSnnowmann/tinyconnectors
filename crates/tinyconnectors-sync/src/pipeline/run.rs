@@ -124,7 +124,13 @@ pub async fn run_sync(
             .map(|(id, version)| (id.as_str(), version.as_str()))
             .collect();
 
+        // Counted rather than inferred from the limit: a page whose last record
+        // is the one that fills the budget left nothing behind, and refusing to
+        // advance past it would re-read a whole page on every run for no gain.
+        let page_len = page.records.len();
+        let mut consumed = 0usize;
         for record in page.records {
+            consumed += 1;
             let version = versions.get(record.item_id.as_str()).copied();
             if !state.needs_ingest(&record.item_id, version) {
                 outcome.records_skipped += 1;
@@ -136,6 +142,23 @@ pub async fn run_sync(
             if outcome.batch.records.len() >= context.limits.max_items {
                 break;
             }
+        }
+
+        if consumed < page_len {
+            // Stop *without* advancing. The records below the cut were never
+            // marked, and this page's `next_cursor` names the page after them:
+            // moving to it steps over records the run never saw.
+            //
+            // A flat toolkit recovers from that on its own — the walk reaches
+            // the end, `restart_from_top` fires, and the second pass finds them
+            // still unmarked. A provider that keeps a floor of its own does
+            // not: Slack's high-water mark would sit above the stranded
+            // records, and no later run would ever ask for them again.
+            //
+            // The cost of stopping here is re-reading one page next time, which
+            // the seen-set turns into skips. The cost of not stopping is losing
+            // whatever sat below the cut.
+            break;
         }
 
         cursor = page.next_cursor;

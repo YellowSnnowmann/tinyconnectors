@@ -14,13 +14,24 @@
 //! slice worth surfacing, ported action-for-action from the lists these
 //! toolkits were already curated against.
 //!
-//! # Identity, not sync
+//! # Flat toolkits, and one that is not
 //!
-//! These providers read profiles. `fetch_records` still takes the trait's
-//! default — no records — because the per-toolkit sync pipelines are the next
-//! part of the migration. A toolkit therefore reports `initial_sync: false` in
-//! the capability matrix until its pipeline lands, which is honest: nothing
-//! will read it yet.
+//! Five of these are *flat*: one action reads the whole account, one cursor
+//! says where it got to, and the provider is a
+//! [`PageSpec`](crate::pipeline::PageSpec) declaration and little else.
+//!
+//! Slack is *scoped*. Its history action reads one channel and requires the
+//! channel's id, so a sync walks the conversation list and pages each channel
+//! with a position of its own. It writes its own `fetch_page` and carries that
+//! position in a composite cursor, which the run loop stores without looking
+//! inside — see [`SlackProvider`] for why that was the right seam and what
+//! it avoided changing.
+//!
+//! Every toolkit registered here can be read. The capability matrix says so —
+//! `initial_sync` and `periodic_sync` are both derived from
+//! [`crate::ConnectorProvider::can_sync`], and a test asserts them for every
+//! row — so registering a provider that cannot sync would make the matrix
+//! promise a user something no build can deliver.
 
 mod clickup;
 mod clickup_catalog;
@@ -33,12 +44,16 @@ mod linear;
 mod linear_catalog;
 mod notion;
 mod notion_catalog;
+mod slack;
+mod slack_catalog;
+mod slack_parse;
 
 pub use clickup::ClickupProvider;
 pub use github::GithubProvider;
 pub use gmail::GmailProvider;
 pub use linear::LinearProvider;
 pub use notion::NotionProvider;
+pub use slack::SlackProvider;
 
 use std::sync::Arc;
 
@@ -53,6 +68,7 @@ pub fn default_registry() -> ProviderRegistry {
         .with(Arc::new(GmailProvider))
         .with(Arc::new(LinearProvider))
         .with(Arc::new(NotionProvider))
+        .with(Arc::new(SlackProvider))
 }
 
 #[cfg(test)]

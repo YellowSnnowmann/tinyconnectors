@@ -256,7 +256,70 @@ async fn stops_at_the_item_limit_and_leaves_the_run_incomplete() {
 
     assert_eq!(outcome.batch.records.len(), 2);
     assert!(!outcome.batch.complete);
+    // The position does *not* move. The page held three and the run took two,
+    // so `p2` names the page after a record this run never saw — see
+    // `a_record_below_the_item_limit_is_not_stepped_over`.
+    assert_eq!(outcome.batch.cursor.as_deref(), None);
+}
+
+#[tokio::test]
+async fn a_record_below_the_item_limit_is_not_stepped_over() {
+    // A page of three against a limit of two leaves `m3` unread *and*
+    // unmarked. Advancing to the page after it would step over it: a flat
+    // toolkit would find it again when the walk wrapped around, but a provider
+    // keeping a floor of its own — Slack's high-water mark — would have put it
+    // below that floor for good.
+    let provider = ScriptedProvider::new(vec![
+        Ok(page(&["m1", "m2", "m3"], Some("p2"))),
+        Ok(page(&["m1", "m2", "m3"], Some("p2"))),
+    ]);
+    let store = Arc::new(MemoryStore::default());
+
+    let first = run_sync(&provider, &context(store.clone(), 2), SyncReason::Scheduled)
+        .await
+        .unwrap();
+    assert_eq!(ids(&first.batch.records), vec!["m1", "m2"]);
+
+    let second = run_sync(&provider, &context(store, 2), SyncReason::Scheduled)
+        .await
+        .unwrap();
+    assert_eq!(
+        ids(&second.batch.records),
+        vec!["m3"],
+        "the record below the cut must survive to the next run"
+    );
+    assert_eq!(
+        second.records_skipped, 2,
+        "the two already taken are recognised, not read twice"
+    );
+}
+
+#[tokio::test]
+async fn a_page_the_limit_exactly_consumes_still_advances() {
+    // The budget runs out on the page's last record, so nothing is left
+    // behind. Holding the position here would re-read a whole page on every
+    // run to rediscover records the seen-set already knows.
+    let provider = ScriptedProvider::new(vec![Ok(page(&["m1", "m2"], Some("p2")))]);
+    let store = Arc::new(MemoryStore::default());
+
+    let outcome = run_sync(&provider, &context(store, 2), SyncReason::Scheduled)
+        .await
+        .unwrap();
+
+    assert_eq!(ids(&outcome.batch.records), vec!["m1", "m2"]);
     assert_eq!(outcome.batch.cursor.as_deref(), Some("p2"));
+    assert!(
+        !outcome.batch.complete,
+        "the provider reported another page"
+    );
+}
+
+/// The ids of a batch, in order.
+fn ids(records: &[ConnectorRecord]) -> Vec<&str> {
+    records
+        .iter()
+        .map(|record| record.item_id.as_str())
+        .collect()
 }
 
 #[tokio::test]
