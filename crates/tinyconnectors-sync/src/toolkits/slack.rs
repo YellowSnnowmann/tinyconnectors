@@ -9,13 +9,19 @@
 //! turn, remembering a position per channel. No single action reads a
 //! workspace.
 //!
+//! It is scoped twice over. A channel's history carries only the top of each
+//! conversation; the replies under a message are a second read, against a
+//! second action, with a cursor of their own. Ingesting the question and not
+//! the answer is the failure mode a Slack memory has to avoid, so a walk
+//! detours into a message's thread before it reads the next page of history.
+//!
 //! # How that fits a pipeline built for one cursor
 //!
 //! [`run_sync`](crate::pipeline::run_sync) never looks inside a cursor — it
 //! stores the string a page reports and hands it back on the next call. So the
-//! two-level walk fits without changing the pipeline at all: the cursor carries
-//! `"<channel index>|<history cursor>"`, and each call returns exactly one page
-//! of one channel.
+//! three-level walk fits without changing the pipeline at all: the cursor
+//! carries `"<index>|<history>|<thread>|<thread cursor>"`, and each call
+//! returns exactly one page of one channel or one thread.
 //!
 //! That is what keeps the rule in [`ConnectorProvider::fetch_page`] intact. The
 //! item limit, the daily request budget and the already-ingested set stay where
@@ -24,10 +30,10 @@
 //!
 //! # What lives beside the cursor, and why it is not in it
 //!
-//! The channel roster, the per-channel high-water marks and the user directory
-//! are kept in this provider's own key in the host's state store, not encoded
-//! in the cursor — a cursor is a position, and a roster of two hundred channels
-//! is not one.
+//! The channel roster, the queue of threads owed by the channel being read, the
+//! per-channel high-water marks and the user directory are kept in this
+//! provider's own key in the host's state store, not encoded in the cursor — a
+//! cursor is a position, and a roster of two hundred channels is not one.
 //!
 //! It has to be a **different key** from the one
 //! [`SyncState`](crate::state::SyncState) uses. The run loop loads that state
@@ -46,7 +52,15 @@
 //! The mark advances when a channel is **exhausted**, never when a page of it
 //! is read: a walk stopped half way through a channel by the item limit must
 //! resume where it stopped, and a mark moved early would step over everything
-//! below it.
+//! below it. A channel is not exhausted until the threads it owes are drained,
+//! so a reply is never stranded above the mark.
+//!
+//! # What this deliberately does not read
+//!
+//! Direct messages and group DMs. The conversation list asks for
+//! `public_channel,private_channel` only. A Slack connection is granted for a
+//! workspace, and quietly ingesting someone's private correspondence into a
+//! memory the agent quotes from is not what connecting a workspace asks for.
 
 use std::collections::BTreeMap;
 
@@ -68,6 +82,8 @@ use crate::{Error, Result};
 const ACTION_CONVERSATIONS: &str = "SLACK_LIST_CONVERSATIONS";
 /// Reads one page of one conversation.
 const ACTION_HISTORY: &str = "SLACK_FETCH_CONVERSATION_HISTORY";
+/// Reads one page of the replies under one message.
+const ACTION_THREAD: &str = "SLACK_FETCH_MESSAGE_THREAD_FROM_A_CONVERSATION";
 /// Reads the workspace the connection belongs to.
 const PROFILE_ACTION: &str = "SLACK_FETCH_TEAM_INFO";
 /// Reads the directory used to turn `<@U…>` into a name.
@@ -79,6 +95,26 @@ const ACTION_USERS: &str = "SLACK_LIST_ALL_USERS";
 /// like everything else, so a large workspace costs one extra request per two
 /// hundred channels rather than a loop inside a single page read.
 const CHANNELS_PER_PAGE: usize = 200;
+
+/// Ceiling on messages asked for in one history or thread page.
+///
+/// The run's own item limit is the real bound and is almost always smaller;
+/// this only stops an unbounded limit from asking Slack for more than it will
+/// return anyway.
+const MESSAGES_PER_PAGE: usize = 200;
+
+/// Directory entries asked for per page.
+const USERS_PER_PAGE: usize = 200;
+
+/// Most directory pages read in one walk.
+///
+/// The directory is a nicety — it turns `<@U04AB>` into a name — so it is
+/// bounded rather than walked to the end. A workspace larger than
+/// `USERS_PER_PAGE * USER_PAGES_MAX` people resolves the first thousand and
+/// leaves the rest as ids, which reads worse but costs nothing else. Spending
+/// an unbounded number of requests on it before a single message is read would
+/// be the wrong trade.
+const USER_PAGES_MAX: usize = 5;
 
 /// Longest message body kept, in characters.
 ///
@@ -110,23 +146,51 @@ const FATAL_AUTH_ERRORS: &[&str] = &[
     "missing_scope",
 ];
 
-/// Where the walk is: which channel, and where inside it.
+/// Where the walk is: which channel, where in its history, and which of its
+/// threads is being drained.
 ///
-/// Encoded as `"<index>|<history cursor>"`. Neither half can contain a `|`:
-/// the index is a number and Slack's cursors are base64, whose alphabet does
-/// not include one.
+/// Encoded as `"<index>|<history>|<thread>|<thread cursor>"`. No field can
+/// contain a `|`: the index is a number, a Slack `ts` is digits and a dot, and
+/// Slack's cursors are base64, whose alphabet does not include one.
+///
+/// `history` keeps its meaning while a thread is being read — it is where the
+/// channel resumes once the detour ends.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Cursor {
     /// Position in the roster page held in [`WalkState::channels`].
     index: usize,
     /// Slack's own position inside that channel's history, if part way in.
     history: Option<String>,
+    /// The message whose replies are being read, if the walk is in a thread.
+    thread: Option<String>,
+    /// Slack's position inside those replies, if part way in.
+    reply_page: Option<String>,
 }
 
 impl Cursor {
-    /// A cursor naming `index`, at `history` within it.
+    /// A cursor naming `index`, at `history` within it, reading no thread.
     fn new(index: usize, history: Option<String>) -> Self {
-        Self { index, history }
+        Self {
+            index,
+            history,
+            thread: None,
+            reply_page: None,
+        }
+    }
+
+    /// A cursor part way through the replies under `thread`.
+    fn in_thread(
+        index: usize,
+        history: Option<String>,
+        thread: String,
+        reply_page: Option<String>,
+    ) -> Self {
+        Self {
+            index,
+            history,
+            thread: Some(thread),
+            reply_page,
+        }
     }
 
     /// Read a cursor the pipeline handed back.
@@ -134,21 +198,36 @@ impl Cursor {
     /// A cursor that does not parse restarts the walk rather than failing it:
     /// the seen-set turns the re-read into skips, so the cost of being wrong
     /// here is requests, and the cost of erroring would be a connection that
-    /// never syncs again.
+    /// never syncs again. A cursor written by an older release has fewer
+    /// fields and reads as "not in a thread", which is exactly right.
     fn decode(raw: Option<&str>) -> Self {
         let Some(raw) = raw else {
             return Self::default();
         };
-        let (index, history) = raw.split_once('|').unwrap_or((raw, ""));
+        let mut fields = raw.splitn(4, '|');
+        let index = fields.next().unwrap_or_default().parse().unwrap_or(0);
+        let owned = |field: Option<&str>| {
+            field
+                .filter(|value| !value.is_empty())
+                .map(std::string::ToString::to_string)
+        };
         Self {
-            index: index.parse().unwrap_or(0),
-            history: (!history.is_empty()).then(|| history.to_string()),
+            index,
+            history: owned(fields.next()),
+            thread: owned(fields.next()),
+            reply_page: owned(fields.next()),
         }
     }
 
     /// Render this position for the pipeline to store.
     fn encode(&self) -> String {
-        format!("{}|{}", self.index, self.history.as_deref().unwrap_or(""))
+        format!(
+            "{}|{}|{}|{}",
+            self.index,
+            self.history.as_deref().unwrap_or(""),
+            self.thread.as_deref().unwrap_or(""),
+            self.reply_page.as_deref().unwrap_or("")
+        )
     }
 }
 
@@ -174,6 +253,9 @@ struct WalkState {
     /// Where the next roster page starts, when there is one.
     #[serde(default)]
     channels_cursor: Option<String>,
+    /// Messages in the channel being read whose replies are still owed.
+    #[serde(default)]
+    threads: Vec<String>,
     /// Newest message id fully read per channel, `channel id → Slack ts`.
     #[serde(default)]
     high_water: BTreeMap<String, String>,
@@ -250,6 +332,14 @@ impl WalkState {
     }
 }
 
+/// One page read, and whether it changed anything worth persisting.
+struct Read {
+    /// What to hand back to the run loop.
+    page: ProviderPage,
+    /// Whether [`WalkState`] moved and needs saving.
+    changed: bool,
+}
+
 /// Slack as a connector toolkit.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SlackProvider;
@@ -264,6 +354,7 @@ impl SlackProvider {
     ) -> Result<()> {
         let mut arguments = json!({
             "limit": CHANNELS_PER_PAGE,
+            // Channels only. See the module docs: DMs are deliberately not read.
             "types": "public_channel,private_channel",
             "exclude_archived": true,
         });
@@ -295,29 +386,196 @@ impl SlackProvider {
     /// Refresh the user directory, if it is missing or old.
     ///
     /// A failure here is not a failure of the walk: mentions render as raw ids,
-    /// which is worse to read and no reason to ingest nothing.
-    async fn refresh_users(&self, context: &ProviderContext, walk: &mut WalkState) {
+    /// which is worse to read and no reason to ingest nothing. Bounded by
+    /// [`USER_PAGES_MAX`] — see there for why it does not read to the end.
+    async fn refresh_users(&self, context: &ProviderContext, walk: &mut WalkState) -> bool {
         let now_ms = Utc::now().timestamp_millis();
         if !walk.users_are_stale(now_ms) {
-            return;
+            return false;
         }
-        let arguments = json!({ "limit": CHANNELS_PER_PAGE });
-        let Ok(payload) = context.run(ACTION_USERS, arguments).await else {
-            tracing::debug!("[connectors][slack] user directory unavailable; ids stay raw");
-            return;
-        };
-        walk.users = first_array(
-            &payload,
-            &["/data/members", "/members", "/data/data/members"],
-        )
-        .iter()
-        .filter_map(|user| {
-            let id = pick_str(user, &["id"])?;
-            let name = pick_str(user, &["profile.display_name", "real_name", "name"])?;
-            Some((id, name))
-        })
-        .collect();
+
+        let mut directory = BTreeMap::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..USER_PAGES_MAX {
+            let mut arguments = json!({ "limit": USERS_PER_PAGE });
+            if let Some(cursor) = cursor.as_deref() {
+                arguments["cursor"] = Value::String(cursor.to_string());
+            }
+            let Ok(payload) = context.run(ACTION_USERS, arguments).await else {
+                tracing::debug!("[connectors][slack] user directory unavailable; ids stay raw");
+                break;
+            };
+            for user in &first_array(
+                &payload,
+                &["/data/members", "/members", "/data/data/members"],
+            ) {
+                if let Some(id) = pick_str(user, &["id"])
+                    && let Some(name) =
+                        pick_str(user, &["profile.display_name", "real_name", "name"])
+                {
+                    directory.insert(id, name);
+                }
+            }
+            cursor = next_cursor(&payload).filter(|next| Some(next.as_str()) != cursor.as_deref());
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        if directory.is_empty() {
+            return false;
+        }
+        walk.users = directory;
         walk.users_fetched_ms = now_ms;
+        true
+    }
+
+    /// Move to the next roster page, or report the workspace walked.
+    async fn advance_roster(
+        &self,
+        context: &ProviderContext,
+        walk: &mut WalkState,
+    ) -> Result<Read> {
+        let Some(next) = walk.channels_cursor.clone() else {
+            return Ok(Read {
+                page: empty_page(None),
+                changed: false,
+            });
+        };
+        self.load_channel_page(context, walk, Some(&next)).await?;
+        Ok(Read {
+            page: empty_page(Some(Cursor::new(0, None).encode())),
+            changed: true,
+        })
+    }
+
+    /// Read one page of the replies under the message the cursor names.
+    async fn read_thread(
+        &self,
+        context: &ProviderContext,
+        walk: &mut WalkState,
+        position: &Cursor,
+        channel: &Channel,
+        parent: &str,
+    ) -> Result<Read> {
+        let mut arguments = json!({
+            "channel": channel.id,
+            "ts": parent,
+            "limit": MESSAGES_PER_PAGE,
+        });
+        if let Some(cursor) = position.reply_page.as_deref() {
+            arguments["cursor"] = Value::String(cursor.to_string());
+        }
+
+        let payload = match context.run(ACTION_THREAD, arguments).await {
+            Ok(payload) => payload,
+            Err(error) if is_fatal(&error) => return Err(error),
+            Err(error) => {
+                // A thread that cannot be read costs its replies, not the run.
+                tracing::debug!(
+                    channel = %channel.id,
+                    thread = %parent,
+                    error = %error,
+                    "[connectors][slack] thread skipped"
+                );
+                return Ok(after_thread(walk, position, channel, Vec::new(), None));
+            }
+        };
+
+        let replies = messages_in(&payload);
+        // The parent is repeated as the first reply. It was ingested with the
+        // history page that found it, and the run loop would skip it anyway;
+        // dropping it here saves the round trip through the seen-set.
+        let (records, versions) = records_from(&replies, channel, &walk.users, Some(parent));
+        let more = next_cursor(&payload);
+        let mut read = after_thread(walk, position, channel, records, more);
+        read.page.versions = versions;
+        Ok(read)
+    }
+
+    /// Read one page of the channel the cursor names.
+    async fn read_history(
+        &self,
+        context: &ProviderContext,
+        walk: &mut WalkState,
+        position: &Cursor,
+        channel: &Channel,
+    ) -> Result<Read> {
+        let mut arguments = json!({
+            "channel": channel.id,
+            "inclusive": false,
+            "limit": context.limits.max_items.clamp(1, MESSAGES_PER_PAGE),
+        });
+        if let Some(oldest) = walk.oldest_for(&channel.id, context.limits.depth_days) {
+            arguments["oldest"] = Value::String(oldest);
+        }
+        if let Some(history) = position.history.as_deref() {
+            arguments["cursor"] = Value::String(history.to_string());
+        }
+
+        let payload = match context.run(ACTION_HISTORY, arguments).await {
+            Ok(payload) => payload,
+            Err(error) if is_fatal(&error) => return Err(error),
+            Err(error) => {
+                // One channel the account cannot read is ordinary — archived,
+                // not a member, rate-limited. Skipping it costs that channel;
+                // failing here would cost the workspace.
+                tracing::debug!(
+                    channel = %channel.id,
+                    error = %error,
+                    "[connectors][slack] channel skipped"
+                );
+                walk.threads.clear();
+                return Ok(Read {
+                    page: empty_page(Some(Cursor::new(position.index + 1, None).encode())),
+                    changed: true,
+                });
+            }
+        };
+
+        let messages = messages_in(&payload);
+
+        // Entering a channel: nothing earlier owes it replies, and a queue left
+        // behind by an interrupted walk of another channel must not be drained
+        // against this one.
+        if position.history.is_none() {
+            walk.threads.clear();
+            // Slack returns a channel newest-first, so the newest message of
+            // the whole channel is on its first page. Remember it now and
+            // promote it only when the channel ends — see the module docs.
+            if let Some(newest) = messages.iter().find_map(|m| pick_str(m, &["ts"])) {
+                walk.pending.insert(channel.id.clone(), newest);
+            }
+        }
+
+        // Queue the conversations under this page before reading further: they
+        // belong to messages this page just ingested. Pushed back-to-front
+        // because the queue is drained from its end, which makes the threads
+        // come back in the order Slack listed their parents.
+        walk.threads
+            .extend(messages.iter().rev().filter_map(has_replies));
+
+        let (records, versions) = records_from(&messages, channel, &walk.users, None);
+        let history = next_cursor(&payload);
+        let next = if let Some(parent) = walk.threads.pop() {
+            Cursor::in_thread(position.index, history, parent, None)
+        } else if history.is_some() {
+            Cursor::new(position.index, history)
+        } else {
+            // Nothing more in this channel and nothing owed: promote the mark
+            // it has been collecting, and move on.
+            walk.commit_high_water(&channel.id);
+            Cursor::new(position.index + 1, None)
+        };
+
+        Ok(Read {
+            page: ProviderPage {
+                records,
+                versions,
+                next_cursor: Some(next.encode()),
+            },
+            changed: true,
+        })
     }
 }
 
@@ -354,7 +612,7 @@ impl ConnectorProvider for SlackProvider {
         })
     }
 
-    /// Read one page of one channel, advancing the walk.
+    /// Read one page of one channel, or of one thread, advancing the walk.
     ///
     /// Every return either moves the cursor forward or reports the walk is
     /// over. That is what keeps the run loop from spinning: it stops only on a
@@ -367,112 +625,98 @@ impl ConnectorProvider for SlackProvider {
     ) -> Result<ProviderPage> {
         let position = Cursor::decode(cursor);
         let mut walk = WalkState::load(context).await?;
+        let mut changed = false;
 
         // A run with no cursor is a walk starting: re-read the roster from the
         // top, and refresh the directory it renders names with.
         if cursor.is_none() {
             self.load_channel_page(context, &mut walk, None).await?;
             self.refresh_users(context, &mut walk).await;
+            changed = true;
         }
 
-        let Some(channel) = walk.channel_at(position.index).cloned() else {
-            // Past the end of this roster page: take the next one if Slack
-            // reported one, otherwise the workspace is walked.
-            let next = walk.channels_cursor.clone();
-            let advanced = match next {
-                Some(next) => {
-                    self.load_channel_page(context, &mut walk, Some(&next))
-                        .await?;
-                    Some(Cursor::new(0, None).encode())
+        let read = match walk.channel_at(position.index).cloned() {
+            None => self.advance_roster(context, &mut walk).await?,
+            Some(channel) => match position.thread.clone() {
+                Some(parent) => {
+                    self.read_thread(context, &mut walk, &position, &channel, &parent)
+                        .await?
                 }
-                None => None,
-            };
+                None => {
+                    self.read_history(context, &mut walk, &position, &channel)
+                        .await?
+                }
+            },
+        };
+
+        if changed || read.changed {
             walk.save(context).await?;
-            return Ok(ProviderPage {
-                records: Vec::new(),
-                versions: Vec::new(),
-                next_cursor: advanced,
-            });
-        };
-
-        let mut arguments = json!({
-            "channel": channel.id,
-            "inclusive": false,
-            "limit": context.limits.max_items.clamp(1, CHANNELS_PER_PAGE),
-        });
-        if let Some(oldest) = walk.oldest_for(&channel.id, context.limits.depth_days) {
-            arguments["oldest"] = Value::String(oldest);
         }
-        if let Some(history) = position.history.as_deref() {
-            arguments["cursor"] = Value::String(history.to_string());
-        }
-
-        let payload = match context.run(ACTION_HISTORY, arguments).await {
-            Ok(payload) => payload,
-            Err(error) if is_fatal(&error) => return Err(error),
-            Err(error) => {
-                // One channel the account cannot read is ordinary — archived,
-                // not a member, rate-limited. Skipping it costs that channel;
-                // failing here would cost the workspace.
-                tracing::debug!(
-                    channel = %channel.id,
-                    error = %error,
-                    "[connectors][slack] channel skipped"
-                );
-                walk.save(context).await?;
-                return Ok(ProviderPage {
-                    records: Vec::new(),
-                    versions: Vec::new(),
-                    next_cursor: Some(Cursor::new(position.index + 1, None).encode()),
-                });
-            }
-        };
-
-        let messages = first_array(
-            &payload,
-            &["/data/messages", "/messages", "/data/data/messages"],
-        );
-
-        // Slack returns a channel newest-first, so the newest message of the
-        // whole channel is on its first page. Remember it now and promote it
-        // only when the channel ends — see the module docs.
-        if position.history.is_none()
-            && let Some(newest) = messages.iter().find_map(|m| pick_str(m, &["ts"]))
-        {
-            walk.pending.insert(channel.id.clone(), newest);
-        }
-
-        let mut records = Vec::with_capacity(messages.len());
-        let mut versions = Vec::new();
-        for message in &messages {
-            let Some(record) = record_from(message, &channel, &walk.users) else {
-                continue;
-            };
-            // An edited message re-ingests; an untouched one does not. Slack
-            // reports the edit as its own timestamp, which is exactly a
-            // version.
-            if let Some(edited) = pick_str(message, &["edited.ts"]) {
-                versions.push((record.item_id.clone(), edited));
-            }
-            records.push(record);
-        }
-
-        let next_cursor = if let Some(history) = next_cursor(&payload) {
-            Cursor::new(position.index, Some(history))
-        } else {
-            // Nothing more in this channel: the mark it has been collecting is
-            // safe to promote, and the walk moves on.
-            walk.commit_high_water(&channel.id);
-            Cursor::new(position.index + 1, None)
-        };
-        walk.save(context).await?;
-
-        Ok(ProviderPage {
-            records,
-            versions,
-            next_cursor: Some(next_cursor.encode()),
-        })
+        Ok(read.page)
     }
+}
+
+/// Where the walk goes once a thread page has been read.
+fn after_thread(
+    walk: &mut WalkState,
+    position: &Cursor,
+    channel: &Channel,
+    records: Vec<ConnectorRecord>,
+    more: Option<String>,
+) -> Read {
+    let history = position.history.clone();
+    let next = if let Some(more) = more {
+        // Same thread, further in.
+        position
+            .thread
+            .clone()
+            .map(|parent| Cursor::in_thread(position.index, history, parent, Some(more)))
+    } else if let Some(parent) = walk.threads.pop() {
+        // This channel still owes replies elsewhere.
+        Some(Cursor::in_thread(position.index, history, parent, None))
+    } else if history.is_some() {
+        // Threads drained; carry on where the history left off.
+        Some(Cursor::new(position.index, history))
+    } else {
+        // Nothing left in this channel, replies included: the mark is safe.
+        walk.commit_high_water(&channel.id);
+        Some(Cursor::new(position.index + 1, None))
+    };
+
+    Read {
+        page: ProviderPage {
+            records,
+            versions: Vec::new(),
+            next_cursor: next.map(|cursor| cursor.encode()),
+        },
+        changed: true,
+    }
+}
+
+/// A page carrying nothing, resuming at `next`.
+fn empty_page(next: Option<String>) -> ProviderPage {
+    ProviderPage {
+        records: Vec::new(),
+        versions: Vec::new(),
+        next_cursor: next,
+    }
+}
+
+/// The messages in a history or thread payload, across Composio's envelopes.
+fn messages_in(payload: &Value) -> Vec<Value> {
+    first_array(
+        payload,
+        &["/data/messages", "/messages", "/data/data/messages"],
+    )
+}
+
+/// The timestamp of a message that has replies, if it has any.
+fn has_replies(message: &Value) -> Option<String> {
+    let replies = message
+        .get("reply_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    (replies > 0).then(|| pick_str(message, &["ts"]))?
 }
 
 /// Whether a failure means the whole connection is unusable.
@@ -500,6 +744,37 @@ fn next_cursor(payload: &Value) -> Option<String> {
     .map(str::to_owned)
 }
 
+/// Turn a page of messages into records and the versions they report.
+///
+/// `skip` names a timestamp to leave out — the parent Slack repeats at the head
+/// of its own thread.
+fn records_from(
+    messages: &[Value],
+    channel: &Channel,
+    users: &BTreeMap<String, String>,
+    skip: Option<&str>,
+) -> (Vec<ConnectorRecord>, Vec<(String, String)>) {
+    let mut records = Vec::with_capacity(messages.len());
+    let mut versions = Vec::new();
+    for message in messages {
+        if let Some(skip) = skip
+            && pick_str(message, &["ts"]).as_deref() == Some(skip)
+        {
+            continue;
+        }
+        let Some(record) = record_from(message, channel, users, skip.is_some()) else {
+            continue;
+        };
+        // An edited message re-ingests; an untouched one does not. Slack
+        // reports the edit as its own timestamp, which is exactly a version.
+        if let Some(edited) = pick_str(message, &["edited.ts"]) {
+            versions.push((record.item_id.clone(), edited));
+        }
+        records.push(record);
+    }
+    (records, versions)
+}
+
 /// One message as a record, or `None` when there is nothing to ingest.
 ///
 /// A message with no timestamp has no stable id, and one with no text is a
@@ -509,6 +784,7 @@ fn record_from(
     message: &Value,
     channel: &Channel,
     users: &BTreeMap<String, String>,
+    reply: bool,
 ) -> Option<ConnectorRecord> {
     let ts = pick_str(message, &["ts"])?;
     let text = pick_str(message, &["text"])?;
@@ -525,12 +801,13 @@ fn record_from(
         .map(|id| users.get(&id).cloned().unwrap_or(id))
         .or_else(|| pick_str(message, &["username", "bot_id"]))
         .unwrap_or_else(|| "unknown".to_string());
+    let kind = if reply { " (reply)" } else { "" };
 
     Some(ConnectorRecord {
         // Channel-qualified: a Slack `ts` is unique within a channel, and the
         // run loop dedupes against one flat set for the whole connection.
         item_id: format!("{}:{ts}", channel.id),
-        title: format!("#{} — {author}", channel.name),
+        title: format!("#{} — {author}{kind}", channel.name),
         content: truncate(&rendered),
         mime: Some("text/plain".to_string()),
         url: pick_str(message, &["permalink"]).or_else(|| Some(permalink(&channel.id, &ts))),
@@ -619,8 +896,9 @@ fn resolve(token: &str, users: &BTreeMap<String, String>) -> String {
 
 /// Cap a body at [`MAX_BODY_CHARS`], on a character boundary.
 fn truncate(text: &str) -> String {
+    let text = text.trim();
     if text.chars().count() <= MAX_BODY_CHARS {
-        return text.trim().to_string();
+        return text.to_string();
     }
     text.chars().take(MAX_BODY_CHARS).collect::<String>()
 }

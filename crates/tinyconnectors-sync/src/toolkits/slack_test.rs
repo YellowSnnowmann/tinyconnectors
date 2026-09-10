@@ -126,6 +126,25 @@ fn message(ts: &str, text: &str) -> Value {
     json!({ "ts": ts, "user": "U1", "text": text })
 }
 
+/// Walk to the end, collecting every record id in the order it arrived.
+async fn drain(context: &ProviderContext) -> Vec<String> {
+    let provider = SlackProvider;
+    let mut cursor = None;
+    let mut seen = Vec::new();
+    for _ in 0..12 {
+        let page = provider
+            .fetch_page(context, cursor.as_deref())
+            .await
+            .unwrap();
+        seen.extend(page.records.iter().map(|record| record.item_id.clone()));
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => return seen,
+        }
+    }
+    panic!("the walk did not terminate");
+}
+
 // ── the cursor ──────────────────────────────────────────────────────
 
 #[test]
@@ -726,4 +745,242 @@ fn slack_re_syncs_on_the_interval_its_host_has_always_advertised() {
     // Fifteen minutes. The host's own table has named this for `slack` since
     // long before there was a provider to honour it.
     assert_eq!(SlackProvider.sync_interval_secs(), Some(900));
+}
+
+// ── threads ─────────────────────────────────────────────────────────
+
+fn parent(ts: &str, text: &str, replies: u64) -> Value {
+    json!({ "ts": ts, "user": "U1", "text": text, "reply_count": replies })
+}
+
+#[tokio::test]
+async fn a_thread_is_drained_before_the_next_page_of_history() {
+    // Ingesting the question and not the answer is the failure mode a Slack
+    // memory has to avoid, so the detour happens before history continues.
+    let actions = Arc::new(ScriptedActions::default());
+    actions.queue(
+        "SLACK_LIST_CONVERSATIONS",
+        Ok(channels(&[("C1", "eng")], "")),
+    );
+    actions.queue(
+        "SLACK_FETCH_CONVERSATION_HISTORY",
+        Ok(history(
+            &[parent("1700000001.000100", "question", 2)],
+            "hist2",
+        )),
+    );
+    actions.queue(
+        "SLACK_FETCH_MESSAGE_THREAD_FROM_A_CONVERSATION",
+        Ok(history(
+            &[
+                // Slack repeats the parent at the head of its own thread.
+                parent("1700000001.000100", "question", 2),
+                message("1700000001.000200", "answer"),
+            ],
+            "",
+        )),
+    );
+    actions.queue(
+        "SLACK_FETCH_CONVERSATION_HISTORY",
+        Ok(history(&[message("1700000000.000100", "older")], "")),
+    );
+
+    let context = context(actions.clone(), Arc::new(MemoryStore::default()));
+    let seen = drain(&context).await;
+
+    assert_eq!(
+        seen,
+        vec![
+            "C1:1700000001.000100",
+            "C1:1700000001.000200",
+            "C1:1700000000.000100"
+        ],
+        "the reply must land before the next page of history"
+    );
+    let asked = actions.calls_to("SLACK_FETCH_MESSAGE_THREAD_FROM_A_CONVERSATION");
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0]["ts"], json!("1700000001.000100"));
+    assert_eq!(asked[0]["channel"], json!("C1"));
+}
+
+#[tokio::test]
+async fn a_reply_says_it_is_one() {
+    let actions = Arc::new(ScriptedActions::default());
+    actions.queue(
+        "SLACK_LIST_CONVERSATIONS",
+        Ok(channels(&[("C1", "eng")], "")),
+    );
+    actions.queue(
+        "SLACK_FETCH_CONVERSATION_HISTORY",
+        Ok(history(&[parent("1700000001.000100", "question", 1)], "")),
+    );
+    actions.queue(
+        "SLACK_FETCH_MESSAGE_THREAD_FROM_A_CONVERSATION",
+        Ok(history(
+            &[
+                parent("1700000001.000100", "question", 1),
+                message("1700000001.000200", "answer"),
+            ],
+            "",
+        )),
+    );
+
+    let context = context(actions, Arc::new(MemoryStore::default()));
+    let provider = SlackProvider;
+
+    let first = provider.fetch_page(&context, None).await.unwrap();
+    assert_eq!(first.records[0].title, "#eng — U1");
+
+    let thread = provider
+        .fetch_page(&context, first.next_cursor.as_deref())
+        .await
+        .unwrap();
+    assert_eq!(thread.records.len(), 1, "the parent is not ingested twice");
+    assert_eq!(thread.records[0].title, "#eng — U1 (reply)");
+}
+
+#[tokio::test]
+async fn a_thread_that_spans_pages_is_followed_to_its_end() {
+    let actions = Arc::new(ScriptedActions::default());
+    actions.queue(
+        "SLACK_LIST_CONVERSATIONS",
+        Ok(channels(&[("C1", "eng")], "")),
+    );
+    actions.queue(
+        "SLACK_FETCH_CONVERSATION_HISTORY",
+        Ok(history(&[parent("1700000001.000100", "question", 2)], "")),
+    );
+    actions.queue(
+        "SLACK_FETCH_MESSAGE_THREAD_FROM_A_CONVERSATION",
+        Ok(history(
+            &[message("1700000001.000200", "first")],
+            "replies2",
+        )),
+    );
+    actions.queue(
+        "SLACK_FETCH_MESSAGE_THREAD_FROM_A_CONVERSATION",
+        Ok(history(&[message("1700000001.000300", "second")], "")),
+    );
+
+    let context = context(actions.clone(), Arc::new(MemoryStore::default()));
+    let seen = drain(&context).await;
+
+    assert_eq!(
+        seen,
+        vec![
+            "C1:1700000001.000100",
+            "C1:1700000001.000200",
+            "C1:1700000001.000300"
+        ]
+    );
+    let asked = actions.calls_to("SLACK_FETCH_MESSAGE_THREAD_FROM_A_CONVERSATION");
+    assert_eq!(asked[1]["cursor"], json!("replies2"));
+}
+
+#[tokio::test]
+async fn an_unreadable_thread_costs_its_replies_not_the_run() {
+    let actions = Arc::new(ScriptedActions::default());
+    actions.queue(
+        "SLACK_LIST_CONVERSATIONS",
+        Ok(channels(&[("C1", "eng")], "")),
+    );
+    actions.queue(
+        "SLACK_FETCH_CONVERSATION_HISTORY",
+        Ok(history(
+            &[parent("1700000001.000100", "question", 2)],
+            "hist2",
+        )),
+    );
+    actions.queue(
+        "SLACK_FETCH_MESSAGE_THREAD_FROM_A_CONVERSATION",
+        Err(Error::Action {
+            action: "SLACK_FETCH_MESSAGE_THREAD_FROM_A_CONVERSATION".into(),
+            message: "thread_not_found".into(),
+        }),
+    );
+    actions.queue(
+        "SLACK_FETCH_CONVERSATION_HISTORY",
+        Ok(history(&[message("1700000000.000100", "older")], "")),
+    );
+
+    let context = context(actions, Arc::new(MemoryStore::default()));
+    let seen = drain(&context).await;
+
+    assert_eq!(
+        seen,
+        vec!["C1:1700000001.000100", "C1:1700000000.000100"],
+        "history carries on where the thread failed"
+    );
+}
+
+#[tokio::test]
+async fn a_channel_is_not_finished_until_its_threads_are() {
+    // The high-water mark is what a later run reads from. Promoting it while
+    // replies are still owed would strand them above the mark for ever.
+    let actions = Arc::new(ScriptedActions::default());
+    for _ in 0..2 {
+        actions.queue(
+            "SLACK_LIST_CONVERSATIONS",
+            Ok(channels(&[("C1", "eng")], "")),
+        );
+    }
+    actions.queue(
+        "SLACK_FETCH_CONVERSATION_HISTORY",
+        Ok(history(&[parent("1700000009.000100", "question", 1)], "")),
+    );
+    actions.queue(
+        "SLACK_FETCH_MESSAGE_THREAD_FROM_A_CONVERSATION",
+        Ok(history(&[message("1700000009.000200", "answer")], "")),
+    );
+    actions.queue("SLACK_FETCH_CONVERSATION_HISTORY", Ok(history(&[], "")));
+
+    let context = context(actions.clone(), Arc::new(MemoryStore::default()));
+    let provider = SlackProvider;
+
+    // Walk one: history page, then the thread.
+    let first = provider.fetch_page(&context, None).await.unwrap();
+    let cursor = first.next_cursor.expect("the thread is owed");
+    provider.fetch_page(&context, Some(&cursor)).await.unwrap();
+
+    // Walk two: the mark was promoted only once the thread was drained.
+    provider.fetch_page(&context, None).await.unwrap();
+    let asked = actions.calls_to("SLACK_FETCH_CONVERSATION_HISTORY");
+    assert_eq!(asked[1]["oldest"], json!("1700000009.000100"));
+}
+
+#[tokio::test]
+async fn the_directory_is_read_across_pages() {
+    let actions = Arc::new(ScriptedActions::default());
+    actions.queue(
+        "SLACK_LIST_CONVERSATIONS",
+        Ok(channels(&[("C1", "eng")], "")),
+    );
+    actions.queue(
+        "SLACK_LIST_ALL_USERS",
+        Ok(json!({ "data": {
+            "members": [{ "id": "U1", "real_name": "Ada" }],
+            "response_metadata": { "next_cursor": "users2" }
+        } })),
+    );
+    actions.queue(
+        "SLACK_LIST_ALL_USERS",
+        Ok(json!({ "data": { "members": [{ "id": "U2", "real_name": "Grace" }] } })),
+    );
+    actions.queue(
+        "SLACK_FETCH_CONVERSATION_HISTORY",
+        Ok(history(
+            &[json!({ "ts": "1700000000.000100", "user": "U2", "text": "hi <@U1>" })],
+            "",
+        )),
+    );
+
+    let context = context(actions.clone(), Arc::new(MemoryStore::default()));
+    let page = SlackProvider.fetch_page(&context, None).await.unwrap();
+
+    assert_eq!(actions.calls_to("SLACK_LIST_ALL_USERS").len(), 2);
+    assert_eq!(
+        page.records[0].title, "#eng — Grace",
+        "a name from the second page still resolves"
+    );
+    assert_eq!(page.records[0].content, "hi @Ada");
 }
