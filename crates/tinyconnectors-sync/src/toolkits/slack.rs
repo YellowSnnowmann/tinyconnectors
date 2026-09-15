@@ -612,6 +612,7 @@ impl SlackProvider {
                 records,
                 versions,
                 next_cursor: Some(next.encode()),
+                ..ProviderPage::default()
             },
             changed: true,
         })
@@ -733,6 +734,7 @@ fn after_thread(
             records,
             versions: Vec::new(),
             next_cursor: next.map(|cursor| cursor.encode()),
+            ..ProviderPage::default()
         },
         changed: true,
     }
@@ -741,9 +743,8 @@ fn after_thread(
 /// A page carrying nothing, resuming at `next`.
 fn empty_page(next: Option<String>) -> ProviderPage {
     ProviderPage {
-        records: Vec::new(),
-        versions: Vec::new(),
         next_cursor: next,
+        ..ProviderPage::default()
     }
 }
 

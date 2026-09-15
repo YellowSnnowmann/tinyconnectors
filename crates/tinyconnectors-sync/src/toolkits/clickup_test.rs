@@ -286,6 +286,21 @@ async fn a_workspace_listed_twice_is_walked_once() {
 }
 
 #[tokio::test]
+async fn a_page_read_reports_every_request_it_made() {
+    // The workspace list and the task page are two requests, and the day's
+    // budget has to count both or it lets a run spend twice its limit.
+    let actions = Arc::new(ScriptedActions::default());
+    actions.queue(WORKSPACES, Ok(workspaces(&["w1"])));
+    actions.queue(TASKS, Ok(tasks(1, Some(true))));
+    assert_eq!(read(&actions, None).await.unwrap().requests_used, 2);
+
+    // With no workspace there is no task read: the list is the only request.
+    let actions = Arc::new(ScriptedActions::default());
+    actions.queue(WORKSPACES, Ok(workspaces(&[])));
+    assert_eq!(read(&actions, None).await.unwrap().requests_used.max(1), 1);
+}
+
+#[tokio::test]
 async fn a_failed_read_fails_the_page() {
     // Either request failing is the run's failure to report. An empty page
     // would read as "nothing to sync".

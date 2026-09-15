@@ -3,10 +3,10 @@
 //! `ClickUp` reads tasks one workspace at a time: its task search needs the
 //! workspace's `team_id`, and an account can belong to several. A walk lists
 //! the account's workspaces on every page read and carries its position as
-//! `"<workspace>|<page>"`. Listing each time costs a request per page, one the
-//! day's budget does not count; in exchange, a workspace the account has since
-//! left sends the walk back to the start instead of failing every run that
-//! resumes into it.
+//! `"<workspace>|<page>"`. Listing each time costs a second request per page,
+//! which the page reports so the day's budget counts it; in exchange, a
+//! workspace the account has since left sends the walk back to the start
+//! instead of failing every run that resumes into it.
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -122,6 +122,8 @@ impl ConnectorProvider for ClickupProvider {
             Some(next_page) => Some(format!("{workspace}|{next_page}")),
             None => next_workspace(&workspaces, &workspace).map(|next| format!("{next}|0")),
         };
+        // The workspace list and the task page: the day's budget counts both.
+        read.requests_used = 2;
         Ok(read)
     }
 }

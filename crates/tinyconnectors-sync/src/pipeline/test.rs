@@ -245,8 +245,8 @@ fn record(id: &str) -> ConnectorRecord {
 fn page(ids: &[&str], next: Option<&str>) -> ProviderPage {
     ProviderPage {
         records: ids.iter().map(|id| record(id)).collect(),
-        versions: Vec::new(),
         next_cursor: next.map(str::to_string),
+        ..ProviderPage::default()
     }
 }
 
@@ -262,6 +262,36 @@ fn context(store: Arc<MemoryStore>, max_items: usize) -> ProviderContext {
         actions: Arc::new(NoActions),
         state: store,
     }
+}
+
+#[tokio::test]
+async fn charges_the_budget_for_every_request_a_page_read_made() {
+    // A provider that runs a lookup before its page read spends two requests
+    // a page. Charging one would let a run spend twice the day's limit.
+    let store = Arc::new(MemoryStore::default());
+    let provider = ScriptedProvider::new(vec![
+        Ok(ProviderPage {
+            requests_used: 2,
+            ..page(&["m1"], Some("p2"))
+        }),
+        Ok(page(&["m2"], None)),
+    ]);
+
+    run_sync(
+        &provider,
+        &context(Arc::clone(&store), 100),
+        SyncReason::Manual,
+    )
+    .await
+    .unwrap();
+
+    let state = SyncState::load(store.as_ref(), "gmail", "conn_1")
+        .await
+        .unwrap();
+    assert_eq!(
+        state.daily_budget.requests_used, 3,
+        "two for the first page, one for a page that did not say"
+    );
 }
 
 #[tokio::test]
@@ -413,6 +443,7 @@ async fn re_ingests_a_record_whose_version_changed() {
         records: vec![record("p1")],
         versions: vec![("p1".to_string(), "v2".to_string())],
         next_cursor: None,
+        requests_used: 1,
     })]);
     let outcome = run_sync(&provider, &context(store, 100), SyncReason::Scheduled)
         .await

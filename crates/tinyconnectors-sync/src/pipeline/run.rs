@@ -19,6 +19,13 @@ pub struct ProviderPage {
     pub versions: Vec<(String, String)>,
     /// Where the next page starts, or `None` when this is the last.
     pub next_cursor: Option<String>,
+    /// Provider requests this page read made, charged to the day's budget.
+    ///
+    /// Zero counts as one, since every page read makes at least one request,
+    /// so a provider that reads a page with a single action need not set it.
+    /// A provider that runs a lookup first, such as `ClickUp`'s workspace list,
+    /// reports both, so the budget caps the requests actually made.
+    pub requests_used: u32,
 }
 
 /// What a run did.
@@ -116,7 +123,7 @@ pub async fn run_sync(
         };
 
         outcome.pages_read += 1;
-        state.record_action(1, 0.0);
+        state.record_action(page.requests_used.max(1), 0.0);
 
         let versions: std::collections::HashMap<&str, &str> = page
             .versions

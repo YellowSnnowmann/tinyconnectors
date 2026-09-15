@@ -328,6 +328,7 @@ fn page_from(payload: &Value, spec: &PageSpec) -> ProviderPage {
             // Decided by the read, which knows the page it asked for.
             Paging::Numbered { .. } => None,
         },
+        requests_used: 1,
     }
 }
 
