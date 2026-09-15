@@ -11,6 +11,7 @@ use serde_json::Value;
 use tinyconnectors_bus::records::ConnectorRecord;
 
 use super::slack::Channel;
+use super::slack_files::file_records_from;
 use crate::Error;
 use crate::pipeline::{first_array, pick_str};
 
@@ -97,24 +98,41 @@ pub(super) fn records_from(
         {
             continue;
         }
-        let Some(record) = record_from(message, channel, users, skip.is_some()) else {
-            continue;
-        };
-        // An edited message re-ingests; an untouched one does not. Slack
-        // reports the edit as its own timestamp, which is exactly a version.
-        if let Some(edited) = pick_str(message, &["edited.ts"]) {
-            versions.push((record.item_id.clone(), edited));
+        if let Some(record) = record_from(message, channel, users, skip.is_some()) {
+            // An edited message re-ingests; an untouched one does not. Slack
+            // reports the edit as its own timestamp, which is exactly a version.
+            if let Some(edited) = pick_str(message, &["edited.ts"]) {
+                versions.push((record.item_id.clone(), edited));
+            }
+            records.push(record);
         }
-        records.push(record);
+        // Files are their own records, and carry no version: `edited.ts`
+        // describes the message body, while a file's bytes never change — a
+        // re-upload arrives as a new `file_id`, which is a new record anyway.
+        records.extend(file_records_from(message, channel, users, skip.is_some()));
     }
     (records, versions)
 }
 
-/// One message as a record, or `None` when there is nothing to ingest.
+/// Who a message is from, for display.
 ///
-/// A message with no timestamp has no stable id, and one with no text is a
-/// join notice or a file share whose body is elsewhere. Both would fill a
-/// user's memory with rows that say nothing.
+/// An id the directory cannot resolve is still worth keeping: a reader can look
+/// `U04AB` up, and collapsing every unresolved author into one word would make
+/// messages from different people indistinguishable. This is the same fallback
+/// `render` applies to a mention.
+pub(super) fn author_of(message: &Value, users: &BTreeMap<String, String>) -> String {
+    pick_str(message, &["user"])
+        .map(|id| users.get(&id).cloned().unwrap_or(id))
+        .or_else(|| pick_str(message, &["username", "bot_id"]))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// One message's *text* as a record, or `None` when it carries none.
+///
+/// A message with no timestamp has no stable id, and one with no text is a join
+/// notice, or a file share whose body is the file rather than the message —
+/// [`super::slack_files::file_records_from`] is what reads that. Emitting a row
+/// here for either would say nothing.
 pub(super) fn record_from(
     message: &Value,
     channel: &Channel,
@@ -128,14 +146,7 @@ pub(super) fn record_from(
         return None;
     }
 
-    // An id the directory cannot resolve is still worth keeping: a reader can
-    // look `U04AB` up, and collapsing every unresolved author into one word
-    // would make messages from different people indistinguishable. This is the
-    // same fallback `render` applies to a mention.
-    let author = pick_str(message, &["user"])
-        .map(|id| users.get(&id).cloned().unwrap_or(id))
-        .or_else(|| pick_str(message, &["username", "bot_id"]))
-        .unwrap_or_else(|| "unknown".to_string());
+    let author = author_of(message, users);
     let kind = if reply { " (reply)" } else { "" };
 
     Some(ConnectorRecord {
