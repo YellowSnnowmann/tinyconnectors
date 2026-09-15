@@ -73,9 +73,10 @@ fn every_file_on_one_message_gets_its_own_id() {
 }
 
 #[test]
-fn a_file_without_an_id_or_a_name_is_skipped() {
-    // Both are required: the id is the dedupe key, so a file lacking one would
-    // re-ingest as new on every run, and a nameless file tells a reader nothing.
+fn a_file_without_an_id_or_anything_to_call_it_is_skipped() {
+    // The id is the dedupe key, so a file lacking one would re-ingest as new on
+    // every run. The second entry has neither a name nor a title, which is what
+    // a tombstone for a deleted file looks like.
     let message = json!({
         "ts": "1700000000.000100",
         "user": "U1",
@@ -184,4 +185,72 @@ fn a_file_without_its_own_clock_falls_back_to_the_message() {
         records[0].url, None,
         "no permalink means no url, not a guess"
     );
+}
+
+#[test]
+fn a_file_is_credited_to_its_uploader_not_the_poster() {
+    // Re-sharing someone else's upload, or a bot posting a file a person made,
+    // puts two different people on one message.
+    let mut directory = users();
+    directory.insert("U2".to_string(), "Grace".to_string());
+    let message = json!({
+        "ts": "1700000000.000100",
+        "user": "U1",
+        "text": "look at this",
+        "files": [{ "id": "F1", "name": "grace.png", "user": "U2" }]
+    });
+
+    let records = file_records_from(&message, &channel(), &directory, false);
+
+    assert_eq!(records[0].title, "#eng — Grace shared grace.png");
+}
+
+#[test]
+fn a_file_naming_no_uploader_falls_back_to_the_poster() {
+    let message = json!({
+        "ts": "1700000000.000100",
+        "user": "U1",
+        "files": [{ "id": "F1", "name": "x.png" }]
+    });
+
+    let records = file_records_from(&message, &channel(), &users(), false);
+
+    assert_eq!(records[0].title, "#eng — Ada shared x.png");
+}
+
+#[test]
+fn a_file_with_only_a_title_is_kept_rather_than_dropped() {
+    // `title` is enough to recognise a file by, and dropping it would be the
+    // same silent loss this module exists to undo. Only a payload with neither
+    // a name nor a title is a tombstone.
+    let message = json!({
+        "ts": "1700000000.000100",
+        "user": "U1",
+        "files": [{ "id": "F1", "title": "Deploy notes" }]
+    });
+
+    let records = file_records_from(&message, &channel(), &users(), false);
+
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].title, "#eng — Ada shared Deploy notes");
+}
+
+#[test]
+fn an_edited_file_reports_when_it_was_edited_not_when_it_was_made() {
+    // `updated_at_ms` is the upstream last-modified time. A Slack Post edited
+    // after upload reports both, and `created` would understate it.
+    let message = json!({
+        "ts": "1700000000.000100",
+        "user": "U1",
+        "files": [{
+            "id": "F1",
+            "name": "notes.post",
+            "created": 1_700_000_100,
+            "updated": 1_700_009_000
+        }]
+    });
+
+    let records = file_records_from(&message, &channel(), &users(), false);
+
+    assert_eq!(records[0].updated_at_ms, Some(1_700_009_000_000));
 }

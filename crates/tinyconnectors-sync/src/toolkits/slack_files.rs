@@ -38,30 +38,43 @@ pub(super) fn file_records_from(
         return Vec::new();
     };
 
-    let author = author_of(message, users);
+    let shared_by = author_of(message, users);
     let kind = if reply { " (reply)" } else { "" };
     files
         .iter()
-        .filter_map(|file| record_for(file, channel, &ts, &author, kind))
+        .filter_map(|file| record_for(file, channel, &ts, users, &shared_by, kind))
         .collect()
+}
+
+/// Who uploaded a file, when Slack says.
+///
+/// A file carries its own `user`, and it is not always the one who posted the
+/// message: re-sharing someone else's upload, or a bot posting a file a person
+/// made, both put two different people on one message. Naming the poster in
+/// that case credits the wrong person.
+fn uploader_of(file: &Value, users: &BTreeMap<String, String>) -> Option<String> {
+    pick_str(file, &["user"]).map(|id| users.get(&id).cloned().unwrap_or(id))
 }
 
 /// One file as a record, or `None` when it cannot be identified.
 ///
-/// Both the id and the name are required, and for the same reason: the id is
-/// the dedupe key, so a file without one would re-ingest as something new on
-/// every single run, and a file without a name gives a reader nothing to
-/// recognise it by. Slack sends both for real uploads; what arrives without
-/// them is a tombstone for a file that has since been deleted.
+/// Two things are required. The id, because it is the dedupe key: a file
+/// without one would re-ingest as something new on every single run. And
+/// *something to call it* — `name` normally, `title` when Slack sent only that
+/// — because a record a reader cannot recognise is barely better than the drop
+/// this module exists to undo. A payload with neither is a tombstone for a file
+/// that has since been deleted, and skipping it is right.
 fn record_for(
     file: &Value,
     channel: &Channel,
     ts: &str,
-    author: &str,
+    users: &BTreeMap<String, String>,
+    shared_by: &str,
     kind: &str,
 ) -> Option<ConnectorRecord> {
     let id = pick_str(file, &["id"])?;
     let name = pick_str(file, &["name", "title"])?;
+    let author = uploader_of(file, users).unwrap_or_else(|| shared_by.to_string());
 
     Some(ConnectorRecord {
         // The message timestamp alone is not unique across channels, and one
@@ -77,7 +90,7 @@ fn record_for(
         // A file uploaded long after the message it hangs off — an edit, a
         // later addition to a thread — is better placed by its own clock. The
         // message timestamp is the fallback, not the first choice.
-        updated_at_ms: created_millis(file).or_else(|| to_millis(ts)),
+        updated_at_ms: file_millis(file).or_else(|| to_millis(ts)),
         tags: Vec::new(),
     })
 }
@@ -101,9 +114,17 @@ fn describe(file: &Value, name: &str) -> String {
     parts.join("\n")
 }
 
-/// Slack's `created`, which is whole seconds, in milliseconds.
-fn created_millis(file: &Value) -> Option<i64> {
-    to_millis(&pick_str(file, &["created"])?)
+/// When a file last changed, in milliseconds.
+///
+/// `updated` before `created`: `ConnectorRecord::updated_at_ms` is the upstream
+/// *last-modified* time, and a Slack Post edited after it was uploaded reports
+/// both. Whole seconds either way.
+///
+/// This does not make an edited file re-ingest — file records emit no versions,
+/// and the walk's high-water mark reads the message `ts`, not this. It is the
+/// field meaning what it says.
+fn file_millis(file: &Value) -> Option<i64> {
+    to_millis(&pick_str(file, &["updated", "created"])?)
 }
 
 #[cfg(test)]
