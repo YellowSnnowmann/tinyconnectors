@@ -68,3 +68,9 @@ catalog, its profile action, and a `PageSpec` naming where its records live.
 The specs list alternatives per field because Composio wraps provider payloads
 inconsistently, and the same field arrives under different names from different
 endpoints of one API.
+
+A spec also says how the next page is named: a token the payload hands back,
+or, for GitHub, whose search payload names none, a page number that advances
+while pages come back full and stops at the 1,000 results the search serves.
+Arguments a read cannot go without, such as GitHub's search query, are fixed in
+the spec.

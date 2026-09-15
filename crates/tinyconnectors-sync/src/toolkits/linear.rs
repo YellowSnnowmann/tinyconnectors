@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use super::identity::pick;
 use super::linear_catalog::CURATED;
 use crate::Result;
-use crate::pipeline::{PageSpec, ProviderPage, fetch_page};
+use crate::pipeline::{PageSpec, Paging, ProviderPage, fetch_page};
 use crate::provider::{ConnectorProvider, ProviderContext, ProviderUserProfile};
 use crate::scope::CuratedTool;
 
@@ -27,9 +27,11 @@ const PAGE: PageSpec = PageSpec {
     content_paths: &["description", "descriptionData"],
     url_paths: &["url"],
     version_paths: &["updatedAt"],
+    fixed_arguments: &[],
     page_size_arg: "first",
     depth_window: None,
     cursor_arg: "after",
+    paging: Paging::Token,
     clean_bodies: false,
 };
 

@@ -353,6 +353,132 @@ async fn a_github_numeric_id_becomes_a_record_id() {
 }
 
 #[tokio::test]
+async fn github_searches_what_the_account_is_involved_in() {
+    // GitHub's search rejects a request without `q`, which is how every GitHub
+    // sync failed on its first page. `@me` is the account the action runs as,
+    // so no request is spent looking its login up.
+    let (actions, mut context) = context("github", json!({}));
+    context.limits.depth_days = None;
+    default_registry()
+        .get("github")
+        .unwrap()
+        .fetch_page(&context, None)
+        .await
+        .unwrap();
+
+    let arguments = actions.last_arguments.lock().unwrap().clone().unwrap();
+    assert_eq!(arguments["q"], "involves:@me", "{arguments}");
+    // Most recently updated first, so whatever changed since the last run sits
+    // on the first page a run reads.
+    assert_eq!(arguments["sort"], "updated", "{arguments}");
+    assert_eq!(arguments["order"], "desc", "{arguments}");
+    assert_eq!(
+        arguments["page"], 1,
+        "a first read asks for page one: {arguments}"
+    );
+}
+
+#[tokio::test]
+async fn github_bounds_the_search_to_the_depth_window() {
+    let (actions, mut context) = context("github", json!({}));
+    context.limits.depth_days = Some(30);
+    default_registry()
+        .get("github")
+        .unwrap()
+        .fetch_page(&context, None)
+        .await
+        .unwrap();
+
+    let arguments = actions.last_arguments.lock().unwrap().clone().unwrap();
+    let query = arguments["q"].as_str().expect("github received a query");
+    let date = query
+        .strip_prefix("involves:@me updated:>=")
+        .expect("the window narrows the search rather than replacing it");
+    let parts: Vec<&str> = date.split('-').collect();
+    assert_eq!(
+        parts.iter().map(|part| part.len()).collect::<Vec<_>>(),
+        [4, 2, 2],
+        "YYYY-MM-DD: {query}"
+    );
+    assert!(
+        parts
+            .iter()
+            .all(|part| part.chars().all(|c| c.is_ascii_digit())),
+        "{query}"
+    );
+}
+
+#[tokio::test]
+async fn github_resumes_from_a_page_number() {
+    let (actions, context) = context("github", json!({}));
+    default_registry()
+        .get("github")
+        .unwrap()
+        .fetch_page(&context, Some("3"))
+        .await
+        .unwrap();
+
+    let arguments = actions.last_arguments.lock().unwrap().clone().unwrap();
+    assert_eq!(arguments["page"], 3, "sent as a number: {arguments}");
+}
+
+/// A GitHub search payload holding `count` issues.
+fn github_items(count: usize) -> serde_json::Value {
+    let items: Vec<_> = (0..count)
+        .map(|id| json!({ "id": id, "title": "An issue" }))
+        .collect();
+    json!({ "data": { "items": items, "total_count": 5000 } })
+}
+
+#[tokio::test]
+async fn github_reads_on_while_its_pages_come_back_full() {
+    // GitHub's search names no next page in what it returns, so a full page is
+    // the only sign there may be more.
+    let (_actions, mut context) = context("github", github_items(50));
+    context.limits.max_items = 50;
+    let github = default_registry().get("github").unwrap();
+
+    let first = github.fetch_page(&context, None).await.unwrap();
+    assert_eq!(first.next_cursor.as_deref(), Some("2"));
+    let later = github.fetch_page(&context, Some("7")).await.unwrap();
+    assert_eq!(later.next_cursor.as_deref(), Some("8"));
+}
+
+#[tokio::test]
+async fn github_stops_at_a_short_page() {
+    let (_actions, mut context) = context("github", github_items(49));
+    context.limits.max_items = 50;
+    let page = default_registry()
+        .get("github")
+        .unwrap()
+        .fetch_page(&context, Some("4"))
+        .await
+        .unwrap();
+
+    assert_eq!(page.records.len(), 49);
+    assert!(page.next_cursor.is_none(), "a short page is the last");
+}
+
+#[tokio::test]
+async fn github_never_asks_past_the_thousandth_result() {
+    // The search serves 1,000 results and answers a page beyond them with an
+    // error, which would fail every run that walked that far.
+    let (_actions, mut context) = context("github", github_items(100));
+    context.limits.max_items = 100;
+    let page = default_registry()
+        .get("github")
+        .unwrap()
+        .fetch_page(&context, Some("10"))
+        .await
+        .unwrap();
+
+    assert!(
+        page.next_cursor.is_none(),
+        "page 10 of 100 ends at result 1,000"
+    );
+}
+
+#[tokio::test]
 async fn clickup_reads_its_username_and_avatar() {
     let (_actions, context) = context(
         "clickup",
@@ -396,8 +522,10 @@ async fn every_toolkit_resumes_from_a_cursor() {
     // Slack is absent by design: its cursor names a channel and a position
     // within it, so it is decoded rather than forwarded, and asserting that the
     // raw string reaches the provider would assert the opposite of what it
-    // does. `slack_test.rs` covers its round trip.
-    for toolkit in ["gmail", "github", "notion", "linear", "clickup"] {
+    // does. `slack_test.rs` covers its round trip. GitHub is absent too: its
+    // cursor is a page number, sent as a number, which
+    // `github_resumes_from_a_page_number` covers.
+    for toolkit in ["gmail", "notion", "linear", "clickup"] {
         let (actions, context) = context(toolkit, json!({}));
         default_registry()
             .get(toolkit)
@@ -470,7 +598,7 @@ async fn a_read_without_a_window_stays_unbounded() {
 async fn toolkits_without_a_window_syntax_ignore_the_depth() {
     // Ignored rather than approximated: a provider that cannot express the
     // bound is not asked for everything so the old can be dropped here.
-    for toolkit in ["github", "notion", "linear", "clickup"] {
+    for toolkit in ["notion", "linear", "clickup"] {
         let (actions, mut context) = context(toolkit, json!({}));
         context.limits.depth_days = Some(30);
         default_registry()

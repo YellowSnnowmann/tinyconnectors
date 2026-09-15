@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use super::github_catalog::CURATED;
 use super::identity::pick;
 use crate::Result;
-use crate::pipeline::{PageSpec, ProviderPage, fetch_page};
+use crate::pipeline::{DepthWindow, PageSpec, Paging, ProviderPage, fetch_page};
 use crate::provider::{ConnectorProvider, ProviderContext, ProviderUserProfile};
 use crate::scope::CuratedTool;
 
@@ -22,9 +22,22 @@ const PAGE: PageSpec = PageSpec {
     content_paths: &["body"],
     url_paths: &["html_url", "url"],
     version_paths: &["updated_at"],
+    // The search rejects a request without `q`. `involves:@me` is every issue
+    // and pull request the connected account opened, was assigned, was
+    // mentioned in, or commented on; `@me` is the account the action runs as,
+    // so no request is spent reading its login first. Most recently updated
+    // first, so whatever changed since the last run is on the first page.
+    fixed_arguments: &[
+        ("q", "involves:@me"),
+        ("sort", "updated"),
+        ("order", "desc"),
+    ],
     page_size_arg: "per_page",
-    depth_window: None,
     cursor_arg: "page",
+    // The search's payload names no next page, and the search serves 1,000
+    // results at most.
+    paging: Paging::Numbered { reachable: 1_000 },
+    depth_window: Some(DepthWindow::GithubUpdatedSince),
     clean_bodies: false,
 };
 

@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use super::identity::pick;
 use super::notion_catalog::CURATED;
 use crate::Result;
-use crate::pipeline::{PageSpec, ProviderPage, fetch_page};
+use crate::pipeline::{PageSpec, Paging, ProviderPage, fetch_page};
 use crate::provider::{ConnectorProvider, ProviderContext, ProviderUserProfile};
 use crate::scope::CuratedTool;
 
@@ -22,9 +22,11 @@ const PAGE: PageSpec = PageSpec {
     content_paths: &["content", "markdown", "plain_text"],
     url_paths: &["url", "public_url"],
     version_paths: &["last_edited_time"],
+    fixed_arguments: &[],
     page_size_arg: "page_size",
     depth_window: None,
     cursor_arg: "start_cursor",
+    paging: Paging::Token,
     clean_bodies: false,
 };
 

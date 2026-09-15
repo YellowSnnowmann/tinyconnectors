@@ -33,10 +33,17 @@ pub struct PageSpec {
     pub url_paths: &'static [&'static str],
     /// Dotted paths to try for an item's version, when the source reports one.
     pub version_paths: &'static [&'static str],
+    /// Arguments every page read sends unchanged, as `(name, value)` pairs.
+    ///
+    /// For an action that reads nothing without them: GitHub's issue search
+    /// rejects a request that carries no query.
+    pub fixed_arguments: &'static [(&'static str, &'static str)],
     /// The argument naming how many items to return.
     pub page_size_arg: &'static str,
     /// The argument naming where to resume.
     pub cursor_arg: &'static str,
+    /// How the page after this one is named.
+    pub paging: Paging,
     /// How the toolkit expresses "no older than N days" on a page read, when
     /// it can. `None` reads without a lower bound whatever the limits say.
     ///
@@ -61,15 +68,35 @@ pub struct PageSpec {
 /// storage and the attention of anything reading them back.
 const MAX_BODY_CHARS: usize = 20_000;
 
+/// How a toolkit names the page after the one just read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Paging {
+    /// The payload carries a token for the next page, sent back verbatim as
+    /// the cursor.
+    Token,
+    /// Pages are numbered from one, and the payload does not say whether
+    /// another follows: one does while pages come back full.
+    ///
+    /// GitHub's search reads this way. Its payload names no next page, and it
+    /// answers a page past the results it serves with an error rather than an
+    /// empty page, so a walk has to stop before asking for one.
+    Numbered {
+        /// Results the provider pages through at all, across every page.
+        reachable: u32,
+    },
+}
+
 /// How a toolkit's page read is told to stop at an age.
 ///
-/// One variant per provider syntax. Gmail takes a search string, so the bound
-/// is an `after:` term; a provider whose API has no such argument has no
-/// variant and reads unbounded.
+/// One variant per provider syntax. Gmail and GitHub take search strings, so
+/// the bound is a term in the query; a provider whose API has no such argument
+/// has no variant and reads unbounded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DepthWindow {
     /// Gmail search syntax: `query: "after:YYYY/MM/DD"`.
     GmailQueryAfter,
+    /// GitHub search syntax: `updated:>=YYYY-MM-DD`, added to the `q` query.
+    GithubUpdatedSince,
 }
 
 impl DepthWindow {
@@ -78,6 +105,15 @@ impl DepthWindow {
         match self {
             Self::GmailQueryAfter => {
                 arguments["query"] = Value::String(gmail_after_query(days));
+            }
+            Self::GithubUpdatedSince => {
+                // Narrows the query the spec sends, and never stands in for
+                // one: an `updated:` term on its own would search every
+                // repository on GitHub.
+                if let Some(query) = arguments.get("q").and_then(Value::as_str) {
+                    let bounded = format!("{query} {}", github_updated_since(days));
+                    arguments["q"] = Value::String(bounded);
+                }
             }
         }
     }
@@ -94,6 +130,15 @@ pub(crate) fn gmail_after_query(days: u32) -> String {
     format!("after:{}", since.format("%Y/%m/%d"))
 }
 
+/// The GitHub search term for "updated in the last `days` days".
+///
+/// A calendar date, as for Gmail: a bound whose job is to stop a walk through
+/// years of issues does not need the hour.
+pub(crate) fn github_updated_since(days: u32) -> String {
+    let since = Utc::now() - TimeDelta::days(i64::from(days));
+    format!("updated:>={}", since.format("%Y-%m-%d"))
+}
+
 /// Read one page of `spec` from the connection in `context`.
 ///
 /// # Errors
@@ -108,15 +153,73 @@ pub async fn fetch_page(
     // limit leaves room for three is three ingested and ninety-seven paid for.
     let page_size = context.limits.max_items.clamp(1, 100);
     let mut arguments = json!({ spec.page_size_arg: page_size });
-    if let Some(cursor) = cursor {
-        arguments[spec.cursor_arg] = Value::String(cursor.to_string());
+    for &(name, value) in spec.fixed_arguments {
+        arguments[name] = Value::String(value.to_string());
     }
+    let numbered = match spec.paging {
+        Paging::Token => {
+            if let Some(cursor) = cursor {
+                arguments[spec.cursor_arg] = Value::String(cursor.to_string());
+            }
+            None
+        }
+        Paging::Numbered { reachable } => {
+            let number = page_number(cursor);
+            arguments[spec.cursor_arg] = Value::from(number);
+            Some((number, reachable))
+        }
+    };
     if let (Some(days), Some(window)) = (context.limits.depth_days, spec.depth_window) {
         window.apply(&mut arguments, days);
     }
 
     let payload = context.run(spec.action, arguments).await?;
-    Ok(page_from(&payload, spec))
+    let mut page = page_from(&payload, spec);
+    if let Some((number, reachable)) = numbered {
+        page.next_cursor =
+            next_page_number(number, item_count(&payload, spec), page_size, reachable)
+                .map(|next| next.to_string());
+    }
+    Ok(page)
+}
+
+/// The page a numbered cursor names.
+///
+/// No cursor is the first page, and so is a cursor that is not a positive
+/// number. Starting that walk over costs one re-read, which the seen-set turns
+/// into skips; refusing to read would stall the connection for good.
+fn page_number(cursor: Option<&str>) -> u32 {
+    cursor
+        .and_then(|cursor| cursor.trim().parse::<u32>().ok())
+        .filter(|number| *number >= 1)
+        .unwrap_or(1)
+}
+
+/// The page after `page`, or `None` when `page` is the last worth asking for.
+///
+/// A short page is the last. So is a page that reaches `reachable`, since the
+/// provider answers the one after with an error. A full page that happens to
+/// end the results costs one empty read to discover: the payload does not say.
+fn next_page_number(page: u32, items: usize, page_size: usize, reachable: u32) -> Option<u32> {
+    if items < page_size {
+        return None;
+    }
+    let read = u64::from(page).saturating_mul(u64::try_from(page_size).unwrap_or(u64::MAX));
+    if read >= u64::from(reachable) {
+        return None;
+    }
+    page.checked_add(1)
+}
+
+/// How many items `payload` holds under the spec's pointers.
+///
+/// Counted before any item is dropped for want of an id: whether a page came
+/// back full is a question about the provider's page, not the records kept.
+fn item_count(payload: &Value, spec: &PageSpec) -> usize {
+    spec.item_pointers
+        .iter()
+        .find_map(|pointer| payload.pointer(pointer).and_then(Value::as_array))
+        .map_or(0, Vec::len)
 }
 
 /// Turn a provider payload into a page.

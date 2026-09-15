@@ -4,7 +4,7 @@
 
 use serde_json::json;
 
-use super::{PageSpec, page_from};
+use super::{DepthWindow, PageSpec, Paging, item_count, next_page_number, page_from, page_number};
 
 const SPEC: PageSpec = PageSpec {
     action: "TEST_FETCH",
@@ -14,8 +14,10 @@ const SPEC: PageSpec = PageSpec {
     content_paths: &["body", "text"],
     url_paths: &["url", "webLink"],
     version_paths: &["version", "etag"],
+    fixed_arguments: &[],
     page_size_arg: "max_results",
     cursor_arg: "page_token",
+    paging: Paging::Token,
 
     depth_window: None,
     clean_bodies: true,
@@ -141,4 +143,62 @@ fn carries_a_link_back_to_the_item_when_there_is_one() {
         page.records[0].url.as_deref(),
         Some("https://mail.example.com/m1")
     );
+}
+
+#[test]
+fn a_numbered_read_starts_at_page_one() {
+    assert_eq!(page_number(None), 1);
+    assert_eq!(page_number(Some(" 4 ")), 4);
+    // A position this build cannot read starts the walk over rather than
+    // stalling it: the seen-set turns the re-read into skips.
+    for unreadable in ["", "0", "-2", "page-2"] {
+        assert_eq!(page_number(Some(unreadable)), 1, "{unreadable:?}");
+    }
+}
+
+#[test]
+fn a_full_page_is_followed_by_the_next() {
+    assert_eq!(next_page_number(1, 50, 50, 1_000), Some(2));
+    // A provider that hands back more than was asked for has not run out.
+    assert_eq!(next_page_number(1, 60, 50, 1_000), Some(2));
+}
+
+#[test]
+fn a_short_page_is_the_last() {
+    assert_eq!(next_page_number(3, 49, 50, 1_000), None);
+    assert_eq!(next_page_number(1, 0, 50, 1_000), None);
+}
+
+#[test]
+fn a_walk_stops_where_the_provider_stops_serving() {
+    // GitHub's search answers a page past its thousandth result with an error.
+    assert_eq!(next_page_number(19, 50, 50, 1_000), Some(20));
+    assert_eq!(next_page_number(20, 50, 50, 1_000), None);
+    assert_eq!(next_page_number(u32::MAX, 100, 100, u32::MAX), None);
+}
+
+#[test]
+fn a_page_counts_its_items_before_dropping_any_without_an_id() {
+    // Whether a page came back full is about the provider's page size, not
+    // the number of records kept from it.
+    let payload = json!({ "messages": [{ "subject": "no id" }, { "id": "m1" }] });
+    assert_eq!(item_count(&payload, &SPEC), 2);
+    assert_eq!(page_from(&payload, &SPEC).records.len(), 1);
+    assert_eq!(item_count(&json!({}), &SPEC), 0);
+}
+
+#[test]
+fn a_github_window_narrows_the_query_it_is_given() {
+    let mut arguments = json!({ "q": "involves:@me" });
+    DepthWindow::GithubUpdatedSince.apply(&mut arguments, 30);
+    let query = arguments["q"].as_str().unwrap();
+    assert!(query.starts_with("involves:@me updated:>="), "{query}");
+}
+
+#[test]
+fn a_github_window_without_a_query_leaves_the_read_alone() {
+    // An `updated:` term on its own would search every repository on GitHub.
+    let mut arguments = json!({ "per_page": 50 });
+    DepthWindow::GithubUpdatedSince.apply(&mut arguments, 30);
+    assert_eq!(arguments, json!({ "per_page": 50 }));
 }
