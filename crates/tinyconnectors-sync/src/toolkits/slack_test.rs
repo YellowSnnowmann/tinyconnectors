@@ -1056,3 +1056,55 @@ async fn an_unbounded_run_reads_past_a_bounded_mark() {
         asked[1]
     );
 }
+
+#[tokio::test]
+async fn a_file_share_survives_the_walk_and_reaches_the_page() {
+    // The parse tests prove a file becomes a record. This proves the record
+    // actually comes out of `fetch_page` — the wiring between the two is the
+    // part a payload test cannot see.
+    let actions = Arc::new(ScriptedActions::default());
+    actions.queue(
+        "SLACK_LIST_CONVERSATIONS",
+        Ok(channels(&[("C1", "eng")], "")),
+    );
+    actions.queue(
+        "SLACK_LIST_ALL_USERS",
+        Ok(json!({ "data": { "members": [
+        { "id": "U1", "profile": { "display_name": "Ada" } }
+    ] } })),
+    );
+    actions.queue(
+        "SLACK_FETCH_CONVERSATION_HISTORY",
+        Ok(history(
+            &[json!({
+                "ts": "1700000000.000100",
+                "user": "U1",
+                "text": "",
+                "files": [{
+                    "id": "F1",
+                    "name": "screenshot.png",
+                    "mimetype": "image/png",
+                    "permalink": "https://slack.com/files/F1"
+                }]
+            })],
+            "",
+        )),
+    );
+    actions.queue("SLACK_FETCH_CONVERSATION_HISTORY", Ok(history(&[], "")));
+
+    let context = context(actions.clone(), Arc::new(MemoryStore::default()));
+
+    let page = SlackProvider.fetch_page(&context, None).await.unwrap();
+
+    assert_eq!(
+        page.records.len(),
+        1,
+        "the share carried no comment, so the file is the only record"
+    );
+    assert_eq!(page.records[0].item_id, "C1:1700000000.000100:F1");
+    assert_eq!(page.records[0].title, "#eng — Ada shared screenshot.png");
+    assert_eq!(
+        page.records[0].url.as_deref(),
+        Some("https://slack.com/files/F1")
+    );
+}
