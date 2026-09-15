@@ -123,8 +123,11 @@ pub struct ConnectorSyncResponse {
     /// Detail worth surfacing — the failure, when the run stopped on one.
     ///
     /// A run that stopped part-way still returns what it read: the caller
-    /// should ingest [`Self::batch`] regardless of this field, and call again
-    /// while [`ConnectorRecordBatch::complete`] is false.
+    /// should ingest [`Self::batch`] regardless of this field. Call again
+    /// while [`ConnectorRecordBatch::complete`] is false only after a run that
+    /// did not fail. A [`SyncStage::Failed`] run is not complete either, but it
+    /// has ended: calling again straight away only repeats the failure, so
+    /// retry later if at all, from the next scheduled run for instance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
