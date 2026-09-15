@@ -30,7 +30,9 @@ const PAGE: PageSpec = PageSpec {
     fixed_arguments: &[],
     page_size_arg: "max_results",
     cursor_arg: "page_token",
-    paging: Paging::Token,
+    paging: Paging::Token {
+        next: crate::pipeline::PAGE_TOKEN_POINTERS,
+    },
     depth_window: Some(DepthWindow::GmailQueryAfter),
     clean_bodies: true,
 };

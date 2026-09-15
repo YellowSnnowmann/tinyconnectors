@@ -36,7 +36,11 @@ const PAGE: PageSpec = PageSpec {
     cursor_arg: "page",
     // The search's payload names no next page, and the search serves 1,000
     // results at most.
-    paging: Paging::Numbered { reachable: 1_000 },
+    paging: Paging::Numbered {
+        first: 1,
+        reachable: Some(1_000),
+        last_page: &[],
+    },
     depth_window: Some(DepthWindow::GithubUpdatedSince),
     clean_bodies: false,
 };

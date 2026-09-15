@@ -10,7 +10,7 @@ use chrono::{TimeDelta, Utc};
 use serde_json::{Value, json};
 use tinyconnectors_bus::ConnectorRecord;
 
-use super::json::{first_array, next_page_token, pick_str};
+use super::json::{end_cursor, first_array, flag_at, pick_str, token_at};
 use super::run::ProviderPage;
 use crate::Result;
 use crate::clean::{clean_body, truncate};
@@ -71,18 +71,36 @@ const MAX_BODY_CHARS: usize = 20_000;
 /// How a toolkit names the page after the one just read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Paging {
-    /// The payload carries a token for the next page, sent back verbatim as
-    /// the cursor.
-    Token,
-    /// Pages are numbered from one, and the payload does not say whether
-    /// another follows: one does while pages come back full.
+    /// The payload names the next page with a token, sent back verbatim as the
+    /// cursor: Gmail's `nextPageToken`, Notion's `next_cursor`.
+    Token {
+        /// JSON Pointers to try for the next page's token, in order.
+        next: &'static [&'static str],
+    },
+    /// The payload is a GraphQL connection. The next page starts after its
+    /// `pageInfo.endCursor`, while `pageInfo.hasNextPage` is true.
+    PageInfo {
+        /// JSON Pointers to try for the connection's `pageInfo`, in order.
+        page_info: &'static [&'static str],
+    },
+    /// Pages are numbered, and the payload may not say whether another
+    /// follows.
     ///
-    /// GitHub's search reads this way. Its payload names no next page, and it
-    /// answers a page past the results it serves with an error rather than an
-    /// empty page, so a walk has to stop before asking for one.
+    /// A `last_page` flag is believed when the payload carries one; otherwise
+    /// another page follows while pages come back full. A page with nothing on
+    /// it is the last either way.
+    ///
+    /// GitHub's search counts from one and names no next page. It answers a
+    /// page past the results it serves with an error rather than an empty
+    /// page, so a walk has to stop before asking for one. `ClickUp` counts from
+    /// zero and flags its last page.
     Numbered {
-        /// Results the provider pages through at all, across every page.
-        reachable: u32,
+        /// The number of the first page.
+        first: u32,
+        /// Results the provider pages through at all, when it stops serving.
+        reachable: Option<u32>,
+        /// JSON Pointers to try for the flag the payload sets on its last page.
+        last_page: &'static [&'static str],
     },
 }
 
@@ -149,6 +167,21 @@ pub async fn fetch_page(
     cursor: Option<&str>,
     spec: &PageSpec,
 ) -> Result<ProviderPage> {
+    fetch_page_with(context, cursor, spec, &[]).await
+}
+
+/// [`fetch_page`], plus arguments known only when the page is read, such as the
+/// workspace a `ClickUp` walk has reached.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::Action`] when the action fails.
+pub(crate) async fn fetch_page_with(
+    context: &ProviderContext,
+    cursor: Option<&str>,
+    spec: &PageSpec,
+    this_read: &[(&str, Value)],
+) -> Result<ProviderPage> {
     // Never ask for more than the run can use: a page of a hundred when the
     // limit leaves room for three is three ingested and ninety-seven paid for.
     let page_size = context.limits.max_items.clamp(1, 100);
@@ -156,17 +189,20 @@ pub async fn fetch_page(
     for &(name, value) in spec.fixed_arguments {
         arguments[name] = Value::String(value.to_string());
     }
+    for (name, value) in this_read {
+        arguments[*name] = value.clone();
+    }
     let numbered = match spec.paging {
-        Paging::Token => {
+        Paging::Token { .. } | Paging::PageInfo { .. } => {
             if let Some(cursor) = cursor {
                 arguments[spec.cursor_arg] = Value::String(cursor.to_string());
             }
             None
         }
-        Paging::Numbered { reachable } => {
-            let number = page_number(cursor);
+        Paging::Numbered { first, .. } => {
+            let number = page_number(cursor, first);
             arguments[spec.cursor_arg] = Value::from(number);
-            Some((number, reachable))
+            Some(number)
         }
     };
     if let (Some(days), Some(window)) = (context.limits.depth_days, spec.depth_window) {
@@ -175,38 +211,65 @@ pub async fn fetch_page(
 
     let payload = context.run(spec.action, arguments).await?;
     let mut page = page_from(&payload, spec);
-    if let Some((number, reachable)) = numbered {
-        page.next_cursor =
-            next_page_number(number, item_count(&payload, spec), page_size, reachable)
-                .map(|next| next.to_string());
+    if let (
+        Some(number),
+        Paging::Numbered {
+            first,
+            reachable,
+            last_page,
+        },
+    ) = (numbered, spec.paging)
+    {
+        page.next_cursor = next_page_number(
+            number,
+            first,
+            reachable,
+            item_count(&payload, spec),
+            page_size,
+            flag_at(&payload, last_page),
+        )
+        .map(|next| next.to_string());
     }
     Ok(page)
 }
 
 /// The page a numbered cursor names.
 ///
-/// No cursor is the first page, and so is a cursor that is not a positive
-/// number. Starting that walk over costs one re-read, which the seen-set turns
-/// into skips; refusing to read would stall the connection for good.
-fn page_number(cursor: Option<&str>) -> u32 {
+/// No cursor is the first page, and so is a cursor that is not a page number
+/// at or past `first`. Starting that walk over costs one re-read, which the
+/// seen-set turns into skips; refusing to read would stall the connection for
+/// good.
+fn page_number(cursor: Option<&str>, first: u32) -> u32 {
     cursor
         .and_then(|cursor| cursor.trim().parse::<u32>().ok())
-        .filter(|number| *number >= 1)
-        .unwrap_or(1)
+        .filter(|number| *number >= first)
+        .unwrap_or(first)
 }
 
 /// The page after `page`, or `None` when `page` is the last worth asking for.
 ///
-/// A short page is the last. So is a page that reaches `reachable`, since the
-/// provider answers the one after with an error. A full page that happens to
-/// end the results costs one empty read to discover: the payload does not say.
-fn next_page_number(page: u32, items: usize, page_size: usize, reachable: u32) -> Option<u32> {
-    if items < page_size {
+/// A page with nothing on it is the last. A payload's `last` flag is believed
+/// when there is one; without it, a short page is the last. So is a page that
+/// reaches `reachable`, since the provider answers the one after with an
+/// error. A full page that happens to end the results costs one empty read to
+/// discover when the payload does not say.
+fn next_page_number(
+    page: u32,
+    first: u32,
+    reachable: Option<u32>,
+    items: usize,
+    page_size: usize,
+    last: Option<bool>,
+) -> Option<u32> {
+    if items == 0 || last == Some(true) || (last.is_none() && items < page_size) {
         return None;
     }
-    let read = u64::from(page).saturating_mul(u64::try_from(page_size).unwrap_or(u64::MAX));
-    if read >= u64::from(reachable) {
-        return None;
+    if let Some(reachable) = reachable {
+        let pages_read = u64::from(page.saturating_sub(first)) + 1;
+        let read = pages_read.saturating_mul(u64::try_from(page_size).unwrap_or(u64::MAX));
+        if read >= u64::from(reachable) {
+            return None;
+        }
     }
     page.checked_add(1)
 }
@@ -259,7 +322,12 @@ fn page_from(payload: &Value, spec: &PageSpec) -> ProviderPage {
     ProviderPage {
         records,
         versions,
-        next_cursor: next_page_token(payload),
+        next_cursor: match spec.paging {
+            Paging::Token { next } => token_at(payload, next),
+            Paging::PageInfo { page_info } => end_cursor(payload, page_info),
+            // Decided by the read, which knows the page it asked for.
+            Paging::Numbered { .. } => None,
+        },
     }
 }
 

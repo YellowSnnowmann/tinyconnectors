@@ -26,7 +26,14 @@ const PAGE: PageSpec = PageSpec {
     page_size_arg: "page_size",
     depth_window: None,
     cursor_arg: "start_cursor",
-    paging: Paging::Token,
+    // Notion names the next page `next_cursor`, and leaves it null on the last.
+    paging: Paging::Token {
+        next: &[
+            "/data/next_cursor",
+            "/next_cursor",
+            "/data/data/next_cursor",
+        ],
+    },
     clean_bodies: false,
 };
 

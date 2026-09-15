@@ -20,6 +20,7 @@ const PAGE: PageSpec = PageSpec {
         "/data/issues",
         "/issues",
         "/data/data/issues",
+        "/data/issues/nodes",
         "/data/nodes",
     ],
     id_paths: &["id", "identifier"],
@@ -31,7 +32,16 @@ const PAGE: PageSpec = PageSpec {
     page_size_arg: "first",
     depth_window: None,
     cursor_arg: "after",
-    paging: Paging::Token,
+    // Issues arrive as a GraphQL connection, whose `pageInfo` sits beside its
+    // `nodes`: `endCursor` names the next page only while `hasNextPage` is true.
+    paging: Paging::PageInfo {
+        page_info: &[
+            "/data/pageInfo",
+            "/pageInfo",
+            "/data/data/pageInfo",
+            "/data/issues/pageInfo",
+        ],
+    },
     clean_bodies: false,
 };
 

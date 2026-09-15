@@ -51,16 +51,55 @@ pub fn first_array(value: &Value, pointers: &[&str]) -> Vec<Value> {
 /// next request ask for a page that does not exist — forever.
 #[must_use]
 pub fn next_page_token(value: &Value) -> Option<String> {
-    [
-        "/data/nextPageToken",
-        "/nextPageToken",
-        "/data/data/nextPageToken",
-        "/data/next_page_token",
-        "/next_page_token",
-    ]
-    .iter()
-    .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
-    .map(str::trim)
-    .filter(|token| !token.is_empty())
-    .map(str::to_owned)
+    token_at(value, PAGE_TOKEN_POINTERS)
+}
+
+/// Where a Google-style `nextPageToken` sits, in every envelope Composio uses.
+pub(crate) const PAGE_TOKEN_POINTERS: &[&str] = &[
+    "/data/nextPageToken",
+    "/nextPageToken",
+    "/data/data/nextPageToken",
+    "/data/next_page_token",
+    "/next_page_token",
+];
+
+/// The first string at any of `pointers`, as a page token or cursor.
+///
+/// An empty or blank string is no token, for the reason [`next_page_token`]
+/// gives.
+#[must_use]
+pub(crate) fn token_at(value: &Value, pointers: &[&str]) -> Option<String> {
+    pointers
+        .iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
+}
+
+/// A GraphQL connection's next cursor: `endCursor` from the first `pageInfo`
+/// at any of `pointers`, and only while its `hasNextPage` is true.
+///
+/// A connection reports `endCursor` on its last page too. Following it asks
+/// for a page after the end.
+#[must_use]
+pub(crate) fn end_cursor(value: &Value, pointers: &[&str]) -> Option<String> {
+    let page_info = pointers.iter().find_map(|pointer| value.pointer(pointer))?;
+    if page_info.get("hasNextPage").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    page_info
+        .get("endCursor")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|cursor| !cursor.is_empty())
+        .map(str::to_owned)
+}
+
+/// The first boolean at any of `pointers`, such as a payload's `last_page`.
+#[must_use]
+pub(crate) fn flag_at(value: &Value, pointers: &[&str]) -> Option<bool> {
+    pointers
+        .iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(Value::as_bool))
 }

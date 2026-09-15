@@ -29,7 +29,9 @@ mod json;
 mod page_size;
 mod run;
 
+pub(crate) use fetch::fetch_page_with;
 pub use fetch::{DepthWindow, PageSpec, Paging, fetch_page};
+pub(crate) use json::PAGE_TOKEN_POINTERS;
 pub use json::{first_array, next_page_token, pick_str};
 pub use page_size::{MIN_PAGE_SIZE, is_payload_too_large, shrink_page_size};
 pub use run::{ProviderPage, SyncOutcome, run_sync};

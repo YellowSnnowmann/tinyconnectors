@@ -17,7 +17,9 @@ const SPEC: PageSpec = PageSpec {
     fixed_arguments: &[],
     page_size_arg: "max_results",
     cursor_arg: "page_token",
-    paging: Paging::Token,
+    paging: Paging::Token {
+        next: &["/data/nextPageToken", "/nextPageToken"],
+    },
 
     depth_window: None,
     clean_bodies: true,
@@ -26,6 +28,24 @@ const SPEC: PageSpec = PageSpec {
 /// The same spec, for a toolkit whose bodies are written once and quote nothing.
 const UNCLEANED: PageSpec = PageSpec {
     clean_bodies: false,
+    ..SPEC
+};
+
+/// The same spec, paging a GraphQL connection.
+const CONNECTION: PageSpec = PageSpec {
+    paging: Paging::PageInfo {
+        page_info: &["/data/pageInfo", "/pageInfo"],
+    },
+    ..SPEC
+};
+
+/// The same spec, paging by number.
+const NUMBERED: PageSpec = PageSpec {
+    paging: Paging::Numbered {
+        first: 1,
+        reachable: None,
+        last_page: &[],
+    },
     ..SPEC
 };
 
@@ -99,6 +119,25 @@ fn an_empty_payload_yields_an_empty_final_page() {
 }
 
 #[test]
+fn follows_a_connection_only_while_it_has_a_next_page() {
+    let more = json!({ "data": { "pageInfo": { "hasNextPage": true, "endCursor": "e1" } } });
+    assert_eq!(
+        page_from(&more, &CONNECTION).next_cursor.as_deref(),
+        Some("e1")
+    );
+    let done = json!({ "pageInfo": { "hasNextPage": false, "endCursor": "e1" } });
+    assert!(page_from(&done, &CONNECTION).next_cursor.is_none());
+}
+
+#[test]
+fn a_numbered_page_leaves_its_successor_to_the_read() {
+    // Only the read knows which page it asked for, so the payload alone names
+    // no next page, whatever token it happens to carry.
+    let payload = json!({ "messages": [{ "id": "m1" }], "nextPageToken": "p2" });
+    assert!(page_from(&payload, &NUMBERED).next_cursor.is_none());
+}
+
+#[test]
 fn cleans_a_message_body_when_the_toolkit_asks_for_it() {
     // Otherwise the same footer arrives on every message the user has ever
     // received, and dominates any search run over the result.
@@ -146,35 +185,58 @@ fn carries_a_link_back_to_the_item_when_there_is_one() {
 }
 
 #[test]
-fn a_numbered_read_starts_at_page_one() {
-    assert_eq!(page_number(None), 1);
-    assert_eq!(page_number(Some(" 4 ")), 4);
+fn a_numbered_read_starts_at_the_first_page() {
+    assert_eq!(page_number(None, 1), 1);
+    assert_eq!(page_number(Some(" 4 "), 1), 4);
+    assert_eq!(page_number(None, 0), 0);
+    assert_eq!(page_number(Some("0"), 0), 0);
     // A position this build cannot read starts the walk over rather than
     // stalling it: the seen-set turns the re-read into skips.
     for unreadable in ["", "0", "-2", "page-2"] {
-        assert_eq!(page_number(Some(unreadable)), 1, "{unreadable:?}");
+        assert_eq!(page_number(Some(unreadable), 1), 1, "{unreadable:?}");
     }
 }
 
 #[test]
 fn a_full_page_is_followed_by_the_next() {
-    assert_eq!(next_page_number(1, 50, 50, 1_000), Some(2));
+    assert_eq!(next_page_number(1, 1, Some(1_000), 50, 50, None), Some(2));
     // A provider that hands back more than was asked for has not run out.
-    assert_eq!(next_page_number(1, 60, 50, 1_000), Some(2));
+    assert_eq!(next_page_number(1, 1, Some(1_000), 60, 50, None), Some(2));
+    // With no cap on what the provider serves, the walk goes on while pages do.
+    assert_eq!(next_page_number(500, 0, None, 100, 100, None), Some(501));
 }
 
 #[test]
 fn a_short_page_is_the_last() {
-    assert_eq!(next_page_number(3, 49, 50, 1_000), None);
-    assert_eq!(next_page_number(1, 0, 50, 1_000), None);
+    assert_eq!(next_page_number(3, 1, Some(1_000), 49, 50, None), None);
+}
+
+#[test]
+fn an_empty_page_is_the_last_whatever_its_flag_says() {
+    assert_eq!(next_page_number(1, 1, None, 0, 50, None), None);
+    assert_eq!(next_page_number(1, 0, None, 0, 50, Some(false)), None);
+}
+
+#[test]
+fn a_last_page_flag_is_believed_over_the_page_size() {
+    // `ClickUp` serves its own page size, so a page shorter than the one asked
+    // for is not the last unless it says so, and a full one can be.
+    assert_eq!(next_page_number(2, 0, None, 10, 50, Some(false)), Some(3));
+    assert_eq!(next_page_number(2, 0, None, 100, 50, Some(true)), None);
 }
 
 #[test]
 fn a_walk_stops_where_the_provider_stops_serving() {
     // GitHub's search answers a page past its thousandth result with an error.
-    assert_eq!(next_page_number(19, 50, 50, 1_000), Some(20));
-    assert_eq!(next_page_number(20, 50, 50, 1_000), None);
-    assert_eq!(next_page_number(u32::MAX, 100, 100, u32::MAX), None);
+    assert_eq!(next_page_number(19, 1, Some(1_000), 50, 50, None), Some(20));
+    assert_eq!(next_page_number(20, 1, Some(1_000), 50, 50, None), None);
+    // Pages counted from zero reach the same cap one page number sooner.
+    assert_eq!(next_page_number(8, 0, Some(1_000), 100, 100, None), Some(9));
+    assert_eq!(next_page_number(9, 0, Some(1_000), 100, 100, None), None);
+    assert_eq!(
+        next_page_number(u32::MAX, 1, Some(u32::MAX), 100, 100, None),
+        None
+    );
 }
 
 #[test]

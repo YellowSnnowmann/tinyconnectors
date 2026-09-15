@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use tinyconnectors_bus::{ConnectorRecord, SyncStage};
 
+use super::json::{end_cursor, flag_at, token_at};
 use super::{
     MIN_PAGE_SIZE, ProviderPage, first_array, is_payload_too_large, next_page_token, pick_str,
     run_sync, shrink_page_size,
@@ -20,6 +21,48 @@ use crate::state::{SyncState, SyncStateStore};
 use crate::{Error, Result};
 
 // ── json helpers ────────────────────────────────────────────────────
+
+#[test]
+fn reads_a_cursor_at_the_pointers_a_toolkit_names() {
+    let value = json!({ "data": { "next_cursor": "c2" } });
+    assert_eq!(
+        token_at(&value, &["/next_cursor", "/data/next_cursor"]).as_deref(),
+        Some("c2")
+    );
+    // A null or blank cursor is how a last page says there is no next one.
+    assert!(token_at(&json!({ "next_cursor": null }), &["/next_cursor"]).is_none());
+    assert!(token_at(&json!({ "next_cursor": " " }), &["/next_cursor"]).is_none());
+}
+
+#[test]
+fn follows_an_end_cursor_only_while_there_is_a_next_page() {
+    let more = json!({ "pageInfo": { "hasNextPage": true, "endCursor": "e1" } });
+    assert_eq!(end_cursor(&more, &["/pageInfo"]).as_deref(), Some("e1"));
+    for done in [
+        json!({ "pageInfo": { "hasNextPage": false, "endCursor": "e1" } }),
+        json!({ "pageInfo": { "endCursor": "e1" } }),
+        json!({ "pageInfo": { "hasNextPage": true, "endCursor": " " } }),
+        json!({}),
+    ] {
+        assert!(end_cursor(&done, &["/pageInfo"]).is_none(), "{done}");
+    }
+}
+
+#[test]
+fn reads_a_flag_only_when_it_is_a_boolean() {
+    assert_eq!(
+        flag_at(
+            &json!({ "data": { "last_page": true } }),
+            &["/last_page", "/data/last_page"]
+        ),
+        Some(true)
+    );
+    assert_eq!(
+        flag_at(&json!({ "last_page": "true" }), &["/last_page"]),
+        None
+    );
+    assert_eq!(flag_at(&json!({}), &["/last_page"]), None);
+}
 
 #[test]
 fn picks_the_first_non_empty_scalar() {
