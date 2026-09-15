@@ -272,6 +272,20 @@ async fn workspace_ids_are_read_from_either_envelope() {
 }
 
 #[tokio::test]
+async fn a_workspace_listed_twice_is_walked_once() {
+    // The walk finds the next workspace by position. A repeated id would send
+    // the end of the first copy to the second, and on to itself forever,
+    // never reaching the workspaces listed after it.
+    let actions = Arc::new(ScriptedActions::default());
+    actions.queue(WORKSPACES, Ok(workspaces(&["w1", "w1", "w2"])));
+    actions.queue(TASKS, Ok(tasks(1, Some(true))));
+
+    let page = read(&actions, Some("w1|2")).await.unwrap();
+
+    assert_eq!(page.next_cursor.as_deref(), Some("w2|0"));
+}
+
+#[tokio::test]
 async fn a_failed_read_fails_the_page() {
     // Either request failing is the run's failure to report. An empty page
     // would read as "nothing to sync".

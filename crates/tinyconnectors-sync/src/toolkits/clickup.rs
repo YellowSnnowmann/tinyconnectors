@@ -126,15 +126,25 @@ impl ConnectorProvider for ClickupProvider {
     }
 }
 
-/// The workspace ids a workspaces payload lists, in its order.
+/// The workspace ids a workspaces payload lists, in its order, each once.
+///
+/// Once each: the walk moves to the workspace listed after the one it
+/// finished, found by position, so an id listed twice would send the walk back
+/// into itself and it would never reach the workspaces after it.
 fn workspace_ids(payload: &Value) -> Vec<String> {
-    first_array(
+    let mut ids = Vec::new();
+    for id in first_array(
         payload,
         &["/teams", "/data/teams", "/workspaces", "/data/workspaces"],
     )
     .iter()
     .filter_map(|workspace| pick_str(workspace, &["id", "team_id", "workspace_id"]))
-    .collect()
+    {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids
 }
 
 /// The workspace and page a cursor names, or `None` when it names neither.
